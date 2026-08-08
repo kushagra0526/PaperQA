@@ -1,0 +1,214 @@
+:root {
+  --paper: #eeeae0;
+  --paper-raised: #f5f2ea;
+  --ink: #1c2541;
+  --ink-soft: #3c4566;
+  --rule: #c9c2b0;
+  --muted: #6b6558;
+  --mark: #f4c95d;
+  --mark-ink: #4a3400;
+  --error: #a3402f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  background-image:
+    repeating-linear-gradient(180deg, transparent 0 38px, rgba(28,37,65,0.035) 38px 39px);
+  color: var(--ink);
+  font-family: 'Source Sans 3', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 72px 24px 48px;
+}
+
+.eyebrow {
+  display: block;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.masthead {
+  text-align: center;
+  margin-bottom: 40px;
+}
+
+.masthead h1 {
+  font-family: 'Fraunces', serif;
+  font-optical-sizing: auto;
+  font-weight: 600;
+  font-size: 56px;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.tagline {
+  font-size: 17px;
+  color: var(--ink-soft);
+  margin: 14px auto 0;
+  max-width: 40ch;
+}
+
+.deskform {
+  background: var(--paper-raised);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 28px;
+  box-shadow: 0 1px 0 var(--rule);
+}
+
+.dropzone {
+  position: relative;
+  border: 1.5px dashed var(--rule);
+  border-radius: 2px;
+  padding: 28px 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.dropzone:hover { border-color: var(--ink-soft); }
+
+.dropzone.has-file {
+  border-style: solid;
+  border-color: var(--ink-soft);
+  background: #fbf9f3;
+}
+
+.dropzone p {
+  margin: 0;
+  font-size: 15px;
+  color: var(--muted);
+}
+
+.dropzone.has-file p { color: var(--ink); font-weight: 500; }
+
+.tab {
+  position: absolute;
+  top: -11px;
+  left: 20px;
+  background: var(--ink);
+  color: var(--paper-raised);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  padding: 3px 9px;
+  border-radius: 2px;
+}
+
+.query-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.query-row input[type="text"] {
+  flex: 1;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 13px 14px;
+  font-size: 15px;
+  font-family: inherit;
+  background: #fff;
+  color: var(--ink);
+}
+
+.query-row input[type="text"]:focus {
+  outline: 2px solid var(--ink-soft);
+  outline-offset: 1px;
+}
+
+.query-row button {
+  border: none;
+  background: var(--ink);
+  color: var(--paper-raised);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  padding: 0 22px;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.query-row button:disabled {
+  background: var(--rule);
+  color: #8a8371;
+  cursor: not-allowed;
+}
+
+.query-row button:not(:disabled):hover { background: var(--ink-soft); }
+
+.error {
+  color: var(--error);
+  font-size: 14px;
+  margin-top: 16px;
+}
+
+.result {
+  margin-top: 36px;
+  padding-top: 28px;
+  border-top: 1px solid var(--rule);
+}
+
+.context {
+  font-family: 'Fraunces', serif;
+  font-size: 19px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+}
+
+mark.highlight {
+  background: linear-gradient(120deg, var(--mark) 0%, var(--mark) 100%);
+  background-repeat: no-repeat;
+  background-size: 100% 60%;
+  background-position: 0 88%;
+  color: var(--mark-ink);
+  font-weight: 600;
+  padding: 0 1px;
+}
+
+.answer-line {
+  margin-top: 20px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.answer-label {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.answer-value {
+  font-size: 17px;
+  font-weight: 600;
+}
+
+footer {
+  margin-top: 56px;
+  text-align: center;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+@media (max-width: 480px) {
+  .masthead h1 { font-size: 42px; }
+  .query-row { flex-direction: column; }
+  .query-row button { padding: 13px; }
+}
