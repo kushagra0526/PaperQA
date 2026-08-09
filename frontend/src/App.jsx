@@ -97,7 +97,7 @@ export default function App() {
       )}
 
       <footer>
-        <span>TF-IDF/embedding retrieval → BERT extractive QA (SQuAD-tuned) · runs locally</span>
+        <span>Sentence-embedding retrieval → BERT extractive QA (SQuAD-tuned) · runs locally</span>
       </footer>
     </div>
   );
