@@ -7,15 +7,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, BertForQuestionAnswering
+from transformers import AutoTokenizer, AutoModelForQuestionAnswering
 
 app = FastAPI(title="Scientific Paper QA")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 embedder = SentenceTransformer('all-MiniLM-L6-v2', device=device)
-tokenizer = AutoTokenizer.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
-model = BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+
+# ponytail: lightweight DistilBERT SQuAD model (~250MB) fits inside Render's 512MB free tier RAM limit.
+# Upgrade path: bert-large or roberta-large if hosted on instances with >=2GB RAM.
+QA_MODEL_NAME = "distilbert-base-uncased-distilled-squad"
+tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
+model = AutoModelForQuestionAnswering.from_pretrained(QA_MODEL_NAME)
 model.to(device)
 model.eval()
 

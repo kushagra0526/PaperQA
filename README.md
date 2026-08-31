@@ -3,8 +3,8 @@
 Ask a question about a PDF paper; the answer is extracted from the paper's own text and shown
 highlighted in its original context (not generated/hallucinated).
 
-**Pipeline:** PDF text extraction (pypdf) → sentence-embedding retrieval (`sentence-transformers`,
-cosine similarity) to find the most relevant sentences → BERT (`bert-large-uncased-whole-word-masking-finetuned-squad`)
+**Pipeline:** PDF text extraction (pypdf) → sentence-embedding retrieval (`sentence-transformers/all-MiniLM-L6-v2`,
+cosine similarity) to find the most relevant sentences → DistilBERT (`distilbert-base-uncased-distilled-squad`, ~250MB)
 extractive question answering to pull the exact answer span.
 
 ## Run the backend
@@ -16,8 +16,7 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-First run downloads the BERT model (~1.3GB) and the sentence-embedding model — needs internet access
-and a few minutes.
+First run downloads the DistilBERT model (~250MB) and the sentence-embedding model.
 
 ## Run backend tests
 
