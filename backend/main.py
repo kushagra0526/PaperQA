@@ -1,3 +1,9 @@
+import os
+# ponytail: lock worker threads to 1 to eliminate multi-threading memory pool overhead on 512MB RAM hosts
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import hashlib
 import re
 from io import BytesIO
@@ -15,9 +21,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 device = "cuda" if torch.cuda.is_available() else "cpu"
 embedder = SentenceTransformer('all-MiniLM-L6-v2', device=device)
 
-# ponytail: lightweight DistilBERT SQuAD model (~250MB) fits inside Render's 512MB free tier RAM limit.
-# Upgrade path: bert-large or roberta-large if hosted on instances with >=2GB RAM.
-QA_MODEL_NAME = "distilbert-base-uncased-distilled-squad"
+# ponytail: ultra-compact MiniLM SQuAD2 model (~115MB) designed for sub-512MB RAM cloud tiers.
+QA_MODEL_NAME = "deepset/minilm-uncased-squad2"
 tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
 model = AutoModelForQuestionAnswering.from_pretrained(QA_MODEL_NAME)
 model.to(device)
