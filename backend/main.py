@@ -150,6 +150,18 @@ def get_answer(question: str, context: str) -> dict:
 
 
 @app.get("/")
+def home():
+    return {
+        "status": "online",
+        "service": "PaperQA API",
+        "docs": "/docs",
+        "endpoints": {
+            "ask": "POST /ask (multipart/form-data with file and question)",
+            "health": "GET /health"
+        }
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "cached_docs": len(DOC_CACHE)}
