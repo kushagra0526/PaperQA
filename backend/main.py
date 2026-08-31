@@ -9,7 +9,7 @@ import hashlib
 import re
 from io import BytesIO
 import torch
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile, Form, File
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -149,6 +149,15 @@ def get_answer(question: str, context: str) -> dict:
     }
 
 
+@app.on_event("startup")
+def preload():
+    # Pre-download and cache model on startup so first user request doesn't wait
+    try:
+        get_model()
+    except Exception as e:
+        print(f"Preload warning: {e}")
+
+
 @app.get("/")
 def home():
     return {
@@ -169,23 +178,34 @@ def health():
 
 # ponytail: synchronous def so FastAPI runs CPU/PyTorch workloads in worker threads.
 @app.post("/ask")
-def ask(file: UploadFile, question: str = Form(...)):
-    if not question.strip():
-        return {"answer": "", "context": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
+def ask(file: UploadFile = File(...), question: str = Form(...)):
+    try:
+        if not question or not question.strip():
+            return {"answer": "", "context": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
 
-    file.file.seek(0)
-    file_bytes = file.file.read()
-    if not file_bytes:
-        return {"answer": "", "context": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
+        file.file.seek(0)
+        file_bytes = file.file.read()
+        if not file_bytes:
+            return {"answer": "", "context": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
 
-    doc_data = extract_and_chunk_pdf(file_bytes)
-    context = select_context(doc_data, question)
-    qa_res = get_answer(question, context)
-    return {
-        "answer": qa_res["answer"],
-        "context": context,
-        "char_start": qa_res["char_start"],
-        "char_end": qa_res["char_end"],
-        "confidence": qa_res["confidence"],
-        "found": qa_res["found"]
-    }
+        doc_data = extract_and_chunk_pdf(file_bytes)
+        context = select_context(doc_data, question)
+        qa_res = get_answer(question, context)
+        return {
+            "answer": qa_res.get("answer", ""),
+            "context": context,
+            "char_start": qa_res.get("char_start", -1),
+            "char_end": qa_res.get("char_end", -1),
+            "confidence": qa_res.get("confidence", 0.0),
+            "found": qa_res.get("found", False)
+        }
+    except Exception as exc:
+        return {
+            "answer": "",
+            "context": f"Error processing document: {str(exc)}",
+            "char_start": -1,
+            "char_end": -1,
+            "confidence": 0.0,
+            "found": False,
+            "error": str(exc)
+        }

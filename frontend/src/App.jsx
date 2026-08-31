@@ -21,11 +21,16 @@ export default function App() {
       form.append('file', file);
       form.append('question', question);
       const res = await fetch(API_URL, { method: 'POST', body: form });
-      if (!res.ok) throw new Error('The server could not process this request.');
-      const data = await res.json();
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(data?.detail || data?.error || `Server error (${res.status}): ${res.statusText}`);
+      }
+      if (data?.error) {
+        throw new Error(data.error);
+      }
       setResult(data);
     } catch (err) {
-      setError(err.message || 'Something went wrong.');
+      setError(err.message || 'Something went wrong connecting to the backend.');
     } finally {
       setLoading(false);
     }
