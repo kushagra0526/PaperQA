@@ -176,7 +176,8 @@ def health():
     return {"status": "ok", "cached_docs": len(DOC_CACHE)}
 
 
-# ponytail: synchronous def so FastAPI runs CPU/PyTorch workloads in worker threads.
+# ponytail: accept both POST / and POST /ask to handle whatever URL is provided in frontend config
+@app.post("/")
 @app.post("/ask")
 def ask(file: UploadFile = File(...), question: str = Form(...)):
     try:
