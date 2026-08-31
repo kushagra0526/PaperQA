@@ -19,6 +19,13 @@ uvicorn main:app --reload --port 8000
 First run downloads the BERT model (~1.3GB) and the sentence-embedding model — needs internet access
 and a few minutes.
 
+## Run backend tests
+
+```bash
+cd backend
+python test_qa.py
+```
+
 ## Run the frontend
 
 ```bash
@@ -31,7 +38,8 @@ Opens on `http://localhost:5173` and calls the backend at `http://localhost:8000
 
 ## Notes
 
-- This is extractive QA (BERT finds a span within the retrieved text), not a generative LLM —
-  answers are always verifiable substrings of the paper, which is the point: no hallucination.
-- Retrieval uses sentence embeddings (`all-MiniLM-L6-v2`) rather than TF-IDF for better semantic matching
-  on paraphrased questions.
+- **Extractive QA:** BERT finds a span within the retrieved text—answers are always verifiable substrings of the paper (no hallucination).
+- **Exact Highlighting:** Uses fast tokenizer character offset mapping (`char_start`, `char_end`) to highlight directly in the original context without casing or subword distortion.
+- **Confidence Calibration:** Computes span probabilities and evaluates against `[CLS]` null-answer logits to reject unanswerable or out-of-domain queries.
+- **In-Memory Embedding Cache:** Hashes uploaded PDFs (`SHA-256`) to reuse sentence embeddings across multiple queries on the same paper.
+- **Retrieval:** Uses sentence embeddings (`all-MiniLM-L6-v2`) with cosine similarity for semantic matching.
