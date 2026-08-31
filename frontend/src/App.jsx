@@ -31,17 +31,17 @@ export default function App() {
     }
   }
 
-  // Split the retrieved context around the answer span so the answer
-  // can be rendered as a literal highlighter mark, not a chat bubble.
-  function renderHighlightedContext(context, answer) {
-    if (!answer) return context;
-    const idx = context.indexOf(answer);
-    if (idx === -1) return context;
+  // Slice the retrieved context using exact character offsets from the backend
+  // so the highlighter mark never fails due to casing or subword tokenization.
+  function renderHighlightedContext(context, charStart, charEnd) {
+    if (charStart === undefined || charStart < 0 || !charEnd || charEnd <= charStart) {
+      return context;
+    }
     return (
       <>
-        {context.slice(0, idx)}
-        <mark className="highlight">{answer}</mark>
-        {context.slice(idx + answer.length)}
+        {context.slice(0, charStart)}
+        <mark className="highlight">{context.slice(charStart, charEnd)}</mark>
+        {context.slice(charEnd)}
       </>
     );
   }
@@ -87,17 +87,33 @@ export default function App() {
 
       {result && (
         <section className="result">
-          <span className="eyebrow">Found in the text</span>
-          <p className="context">{renderHighlightedContext(result.context, result.answer)}</p>
-          <div className="answer-line">
-            <span className="answer-label">Answer</span>
-            <span className="answer-value">{result.answer}</span>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <span className="eyebrow" style={{ margin: 0 }}>Found in the text</span>
+            {result.confidence > 0 && (
+              <span className="eyebrow" style={{ margin: 0 }}>
+                Confidence: {(result.confidence * 100).toFixed(1)}%
+              </span>
+            )}
           </div>
+
+          {result.found ? (
+            <>
+              <p className="context">{renderHighlightedContext(result.context, result.char_start, result.char_end)}</p>
+              <div className="answer-line">
+                <span className="answer-label">Answer</span>
+                <span className="answer-value">{result.answer}</span>
+              </div>
+            </>
+          ) : (
+            <p className="context" style={{ fontStyle: 'italic', color: 'var(--muted)' }}>
+              No confident answer could be extracted from the retrieved passages in this paper.
+            </p>
+          )}
         </section>
       )}
 
       <footer>
-        <span>Sentence-embedding retrieval → BERT extractive QA (SQuAD-tuned) · runs locally</span>
+        <span>Sentence-embedding retrieval → BERT extractive QA (SQuAD-tuned) · cached locally</span>
       </footer>
     </div>
   );
