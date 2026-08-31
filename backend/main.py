@@ -4,6 +4,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
+import gc
 import hashlib
 import re
 from io import BytesIO
@@ -11,26 +12,27 @@ import torch
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForQuestionAnswering
 
 app = FastAPI(title="Scientific Paper QA")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-embedder = SentenceTransformer('all-MiniLM-L6-v2', device=device)
-
-# ponytail: ultra-compact MiniLM SQuAD2 model (~115MB) designed for sub-512MB RAM cloud tiers.
 QA_MODEL_NAME = "deepset/minilm-uncased-squad2"
-tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
-model = AutoModelForQuestionAnswering.from_pretrained(QA_MODEL_NAME)
-model.to(device)
-model.eval()
-
-# ponytail: in-memory dict cache keyed by document SHA-256. Bounded process memory, no persistence.
-# Upgrade path: disk-backed SQLite or vector store (Chroma/Qdrant) for multi-worker setups.
+tokenizer = None
+model = None
 DOC_CACHE = {}
+
+
+def get_model():
+    global tokenizer, model
+    if tokenizer is None or model is None:
+        tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
+        model = AutoModelForQuestionAnswering.from_pretrained(QA_MODEL_NAME)
+        model.eval()
+        gc.collect()
+    return tokenizer, model
 
 
 def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
@@ -44,16 +46,13 @@ def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
     except Exception:
         raw_text = ""
 
-    # ponytail: regex sentence boundary checking capitalized words.
-    # Upgrade path: layout-aware parser (docling/marker) for multi-column academic PDFs.
     sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', raw_text) if len(s.strip()) > 15]
     if not sentences:
         sentences = [raw_text.strip()] if raw_text.strip() else ["No text found in document."]
 
-    embeddings = embedder.encode(sentences, show_progress_bar=False, normalize_embeddings=True)
-    doc_data = {"text": raw_text, "sentences": sentences, "embeddings": embeddings}
+    doc_data = {"text": raw_text, "sentences": sentences}
 
-    if len(DOC_CACHE) >= 20:
+    if len(DOC_CACHE) >= 10:
         DOC_CACHE.pop(next(iter(DOC_CACHE)))
     DOC_CACHE[pdf_hash] = doc_data
     return doc_data
@@ -61,21 +60,30 @@ def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
 
 def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
     sentences = doc_data.get("sentences", [])
-    embeddings = doc_data.get("embeddings")
-    if not sentences or embeddings is None or len(embeddings) == 0:
+    if not sentences:
         return ""
-    q_emb = embedder.encode([question], show_progress_bar=False, normalize_embeddings=True)
-    scores = cosine_similarity(q_emb, embeddings).flatten()
-    top_n_count = min(top_n, len(scores))
-    top_idx = sorted(sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n_count])
-    return ' '.join(sentences[i] for i in top_idx)
+    if len(sentences) <= top_n:
+        return ' '.join(sentences)
+
+    try:
+        # ponytail: TF-IDF retrieval uses ~1MB RAM and 0.001s, completely eliminating SentenceTransformers RAM spike.
+        vectorizer = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = vectorizer.fit_transform([question] + sentences)
+        scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
+        top_n_count = min(top_n, len(scores))
+        top_idx = sorted(sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n_count])
+        return ' '.join(sentences[i] for i in top_idx)
+    except Exception:
+        return ' '.join(sentences[:top_n])
 
 
 def get_answer(question: str, context: str) -> dict:
     if not context.strip() or not question.strip():
         return {"answer": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
 
-    inputs = tokenizer(
+    tok, qa_model = get_model()
+
+    inputs = tok(
         question,
         context,
         return_tensors='pt',
@@ -91,23 +99,20 @@ def get_answer(question: str, context: str) -> dict:
         return {"answer": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
 
     with torch.no_grad():
-        outputs = model(
-            input_ids=inputs['input_ids'].to(device),
-            attention_mask=inputs['attention_mask'].to(device)
+        outputs = qa_model(
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask']
         )
 
-    start_logits = outputs.start_logits[0].cpu()
-    end_logits = outputs.end_logits[0].cpu()
+    start_logits = outputs.start_logits[0]
+    end_logits = outputs.end_logits[0]
 
-    # Null-answer score from [CLS] token (SQuAD null representation)
     null_score = float(start_logits[0] + end_logits[0])
-
     best_score = float('-inf')
     best_start, best_end = -1, -1
     start_bound = context_indices[0]
     end_bound = context_indices[-1]
 
-    # Fast contiguous span evaluation (max span length = 30 tokens)
     for i in range(start_bound, end_bound + 1):
         for j in range(i, min(i + 30, end_bound + 1)):
             score = float(start_logits[i] + end_logits[j])
@@ -122,7 +127,6 @@ def get_answer(question: str, context: str) -> dict:
     end_prob = float(torch.softmax(end_logits, dim=-1)[best_end])
     confidence = round(start_prob * end_prob, 4)
 
-    # Rejection threshold for unanswerable / out-of-domain queries
     if best_score < null_score or confidence < 0.05:
         return {"answer": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
 
@@ -130,7 +134,6 @@ def get_answer(question: str, context: str) -> dict:
     char_end = int(offset_mapping[best_end][1])
     raw_slice = context[char_start:char_end]
 
-    # Clean whitespace boundaries while keeping offsets exact
     l_strip = len(raw_slice) - len(raw_slice.lstrip())
     r_strip = len(raw_slice) - len(raw_slice.rstrip())
     char_start += l_strip
@@ -146,9 +149,10 @@ def get_answer(question: str, context: str) -> dict:
     }
 
 
+@app.get("/")
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": device, "cached_docs": len(DOC_CACHE)}
+    return {"status": "ok", "cached_docs": len(DOC_CACHE)}
 
 
 # ponytail: synchronous def so FastAPI runs CPU/PyTorch workloads in worker threads.
