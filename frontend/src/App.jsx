@@ -1,6 +1,8 @@
 import { useState, useRef } from 'react';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/ask';
+// Normalize API_URL so it works whether user provides base domain or /ask path
+const baseApiUrl = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
+const API_URL = baseApiUrl.endsWith('/ask') ? baseApiUrl : `${baseApiUrl}/ask`;
 
 export default function App() {
   const [file, setFile] = useState(null);
