@@ -1,8 +1,12 @@
 import { useState, useRef } from 'react';
 
 // Normalize API_URL so it works whether user provides base domain or /ask path
-const baseApiUrl = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
-const API_URL = baseApiUrl.endsWith('/ask') ? baseApiUrl : `${baseApiUrl}/ask`;
+let rawUrl = (import.meta.env.VITE_API_URL || 'http://localhost:8000').trim().replace(/\/+$/, '');
+// Auto-upgrade to https if running on https frontend to prevent Mixed Content blocking
+if (typeof window !== 'undefined' && window.location.protocol === 'https:' && rawUrl.startsWith('http://') && !rawUrl.includes('localhost')) {
+  rawUrl = rawUrl.replace('http://', 'https://');
+}
+const API_URL = rawUrl.endsWith('/ask') ? rawUrl : `${rawUrl}/ask`;
 
 export default function App() {
   const [file, setFile] = useState(null);
@@ -32,7 +36,11 @@ export default function App() {
       }
       setResult(data);
     } catch (err) {
-      setError(err.message || 'Something went wrong connecting to the backend.');
+      if (err.message.includes('Failed to fetch')) {
+        setError('Could not reach backend. If using Render Free tier, the server may be waking up from sleep (wait 20-30s and retry) or verify your VITE_API_URL.');
+      } else {
+        setError(err.message || 'Something went wrong connecting to the backend.');
+      }
     } finally {
       setLoading(false);
     }
