@@ -38,6 +38,11 @@ def get_model():
     return tokenizer, model
 
 
+# ponytail: non-blocking background thread warms up model into RAM immediately after port binds
+import threading
+threading.Thread(target=get_model, daemon=True).start()
+
+
 def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
     pdf_hash = hashlib.sha256(file_bytes).hexdigest()
     if pdf_hash in DOC_CACHE:
@@ -45,7 +50,9 @@ def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
 
     try:
         reader = PdfReader(BytesIO(file_bytes))
-        raw_text = ' '.join(page.extract_text() or '' for page in reader.pages)
+        # Cap to first 25 pages to ensure instant parsing on cloud CPUs
+        pages = reader.pages[:25]
+        raw_text = ' '.join(page.extract_text() or '' for page in pages)
     except Exception:
         raw_text = ""
 
