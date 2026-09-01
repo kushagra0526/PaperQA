@@ -29,7 +29,10 @@ def get_model():
     global tokenizer, model
     if tokenizer is None or model is None:
         tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
-        model = AutoModelForQuestionAnswering.from_pretrained(QA_MODEL_NAME)
+        model = AutoModelForQuestionAnswering.from_pretrained(
+            QA_MODEL_NAME,
+            low_cpu_mem_usage=True
+        )
         model.eval()
         gc.collect()
     return tokenizer, model
