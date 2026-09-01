@@ -149,15 +149,6 @@ def get_answer(question: str, context: str) -> dict:
     }
 
 
-@app.on_event("startup")
-def preload():
-    # Pre-download and cache model on startup so first user request doesn't wait
-    try:
-        get_model()
-    except Exception as e:
-        print(f"Preload warning: {e}")
-
-
 @app.get("/")
 def home():
     return {
