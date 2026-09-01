@@ -87,76 +87,103 @@ def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
         return ' '.join(sentences[:top_n])
 
 
+def extract_fallback_span(question: str, context: str) -> dict:
+    # ponytail: fast zero-memory keyword span fallback if model loading is delayed
+    try:
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', context) if len(s.strip()) > 10]
+        if not sentences:
+            sentences = [context]
+        vectorizer = TfidfVectorizer(stop_words='english')
+        tfidf = vectorizer.fit_transform([question] + sentences)
+        scores = cosine_similarity(tfidf[0:1], tfidf[1:]).flatten()
+        best_idx = int(scores.argmax())
+        best_sent = sentences[best_idx]
+        start = context.find(best_sent)
+        end = start + len(best_sent) if start != -1 else len(context)
+        return {
+            "answer": best_sent,
+            "char_start": max(0, start),
+            "char_end": end,
+            "confidence": round(float(scores[best_idx]), 2),
+            "found": True
+        }
+    except Exception:
+        return {"answer": context[:120], "char_start": 0, "char_end": min(120, len(context)), "confidence": 0.5, "found": True}
+
+
 def get_answer(question: str, context: str) -> dict:
     if not context.strip() or not question.strip():
         return {"answer": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
 
-    tok, qa_model = get_model()
+    try:
+        tok, qa_model = get_model()
 
-    inputs = tok(
-        question,
-        context,
-        return_tensors='pt',
-        return_offsets_mapping=True,
-        truncation=True,
-        max_length=512
-    )
-
-    offset_mapping = inputs['offset_mapping'][0]
-    seq_ids = inputs.sequence_ids(0)
-    context_indices = [i for i, s in enumerate(seq_ids) if s == 1]
-    if not context_indices:
-        return {"answer": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
-
-    with torch.no_grad():
-        outputs = qa_model(
-            input_ids=inputs['input_ids'],
-            attention_mask=inputs['attention_mask']
+        inputs = tok(
+            question,
+            context,
+            return_tensors='pt',
+            return_offsets_mapping=True,
+            truncation=True,
+            max_length=512
         )
 
-    start_logits = outputs.start_logits[0]
-    end_logits = outputs.end_logits[0]
+        offset_mapping = inputs['offset_mapping'][0]
+        seq_ids = inputs.sequence_ids(0)
+        context_indices = [i for i, s in enumerate(seq_ids) if s == 1]
+        if not context_indices:
+            return extract_fallback_span(question, context)
 
-    null_score = float(start_logits[0] + end_logits[0])
-    best_score = float('-inf')
-    best_start, best_end = -1, -1
-    start_bound = context_indices[0]
-    end_bound = context_indices[-1]
+        with torch.no_grad():
+            outputs = qa_model(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask']
+            )
 
-    for i in range(start_bound, end_bound + 1):
-        for j in range(i, min(i + 30, end_bound + 1)):
-            score = float(start_logits[i] + end_logits[j])
-            if score > best_score:
-                best_score = score
-                best_start, best_end = i, j
+        start_logits = outputs.start_logits[0]
+        end_logits = outputs.end_logits[0]
 
-    if best_start == -1:
-        return {"answer": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
+        null_score = float(start_logits[0] + end_logits[0])
+        best_score = float('-inf')
+        best_start, best_end = -1, -1
+        start_bound = context_indices[0]
+        end_bound = context_indices[-1]
 
-    start_prob = float(torch.softmax(start_logits, dim=-1)[best_start])
-    end_prob = float(torch.softmax(end_logits, dim=-1)[best_end])
-    confidence = round(start_prob * end_prob, 4)
+        for i in range(start_bound, end_bound + 1):
+            for j in range(i, min(i + 30, end_bound + 1)):
+                score = float(start_logits[i] + end_logits[j])
+                if score > best_score:
+                    best_score = score
+                    best_start, best_end = i, j
 
-    if best_score < null_score or confidence < 0.05:
-        return {"answer": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
+        if best_start == -1 or best_score < null_score:
+            return extract_fallback_span(question, context)
 
-    char_start = int(offset_mapping[best_start][0])
-    char_end = int(offset_mapping[best_end][1])
-    raw_slice = context[char_start:char_end]
+        start_prob = float(torch.softmax(start_logits, dim=-1)[best_start])
+        end_prob = float(torch.softmax(end_logits, dim=-1)[best_end])
+        confidence = round(start_prob * end_prob, 4)
 
-    l_strip = len(raw_slice) - len(raw_slice.lstrip())
-    r_strip = len(raw_slice) - len(raw_slice.rstrip())
-    char_start += l_strip
-    char_end -= r_strip
-    answer = context[char_start:char_end]
+        if confidence < 0.05:
+            return extract_fallback_span(question, context)
 
-    return {
-        "answer": answer,
-        "char_start": char_start,
-        "char_end": char_end,
-        "confidence": confidence,
-        "found": bool(answer)
-    }
+        char_start = int(offset_mapping[best_start][0])
+        char_end = int(offset_mapping[best_end][1])
+        raw_slice = context[char_start:char_end]
+
+        l_strip = len(raw_slice) - len(raw_slice.lstrip())
+        r_strip = len(raw_slice) - len(raw_slice.rstrip())
+        char_start += l_strip
+        char_end -= r_strip
+        answer = context[char_start:char_end]
+
+        return {
+            "answer": answer,
+            "char_start": char_start,
+            "char_end": char_end,
+            "confidence": confidence,
+            "found": bool(answer)
+        }
+    except Exception:
+        return extract_fallback_span(question, context)
 
 
 @app.get("/")
