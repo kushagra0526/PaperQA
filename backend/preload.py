@@ -45,9 +45,16 @@ if __name__ == "__main__":
 
     # Step 3: Save the tokenizer alongside the quantized model so the entire
     # onnx_model/ directory is self-contained for loading at runtime.
+    # AutoTokenizer.save_pretrained() writes tokenizer.json (among other files);
+    # main.py loads only tokenizer.json via tokenizers.Tokenizer.from_file().
     print("  [3/3] Saving tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.save_pretrained(ONNX_MODEL_DIR)
+    tok_json = Path(ONNX_MODEL_DIR) / "tokenizer.json"
+    if tok_json.exists():
+        print(f"  tokenizer.json saved: {tok_json}  ({tok_json.stat().st_size / 1024:.1f} KB)")
+    else:
+        print("  WARNING: tokenizer.json not found after save_pretrained!")
 
     print(f"Quantized ONNX model saved to {ONNX_MODEL_DIR}/")
 
