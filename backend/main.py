@@ -36,8 +36,8 @@ from schemas import AskResponse, HealthResponse
 # Defaults match the hardcoded values in retrieval.py.
 # ---------------------------------------------------------------------------
 import retrieval as _retrieval
-_retrieval.RETRIEVAL_MODE = os.environ.get("RETRIEVAL_MODE", "tfidf")
-_retrieval.USE_RERANKER   = os.environ.get("USE_RERANKER", "false").lower() == "true"
+_retrieval.RETRIEVAL_MODE = os.environ.get("RETRIEVAL_MODE", "hybrid")
+_retrieval.USE_RERANKER   = os.environ.get("USE_RERANKER", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # CORS — driven by environment variable so it can be tightened per-deployment

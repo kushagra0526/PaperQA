@@ -8,8 +8,8 @@ Public API:
   resolve_page_number(char_start, ...)         -> (int|None, int|None)
 
 Module-level flags (monkeypatch-safe — eval.py patches these between runs):
-  RETRIEVAL_MODE      "tfidf" | "dense" | "hybrid"
-  USE_RERANKER        bool
+  RETRIEVAL_MODE      "tfidf" | "dense" | "hybrid" (default: "hybrid")
+  USE_RERANKER        bool (default: True)
   RERANKER_CANDIDATES int
   RERANKER_MARGIN     float
   MIN_RERANKED        int
@@ -32,17 +32,17 @@ from qa import CUSTOM_STOPWORDS, get_model, get_reranker
 
 # Controls which retrieval strategy select_context uses for the candidate
 # window shortlist before (optionally) reranking.
-#   "tfidf"  — TF-IDF cosine similarity only (default, zero extra memory)
+#   "tfidf"  — TF-IDF cosine similarity only (zero extra memory)
 #   "dense"  — dense bi-encoder retrieval (requires embedding model in memory)
 #   "hybrid" — RRF fusion of TF-IDF + dense scores
 # Only "tfidf" is fully implemented; dense/hybrid fall through to TF-IDF.
-RETRIEVAL_MODE: str = "tfidf"
+RETRIEVAL_MODE: str = "hybrid"
 
 # When True, the top-N candidates from RETRIEVAL_MODE are re-scored and
 # re-sorted by the cross-encoder before being passed to the QA model.
-# Set to False (default) to skip reranking entirely — the reranker model is
+# Set to False to skip reranking entirely — the reranker model is
 # never loaded when this flag is False.
-USE_RERANKER: bool = False
+USE_RERANKER: bool = True
 
 # Candidate pool size when USE_RERANKER is True.
 RERANKER_CANDIDATES: int = 20
