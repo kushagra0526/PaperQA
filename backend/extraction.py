@@ -168,6 +168,98 @@ def _build_sentence_meta(
 # Main extraction entry point
 # ---------------------------------------------------------------------------
 
+def _mark_references_section(
+    sentences: list[str],
+    sentence_meta: list[dict],
+    raw_text: str = "",
+) -> None:
+    """
+    Detect the start of a references/bibliography section and set
+    ``"past_references": True`` on every sentence_meta entry from that
+    point onward.  Mutates *sentence_meta* in-place; returns nothing.
+
+    Two-pass detection — either is sufficient to trigger the filter:
+
+    Pass 1 — sentence-level: a sentence that matches a canonical heading
+    string case-insensitively AND is ≤ 40 characters is treated as the
+    boundary.  This catches PDFs where the heading is its own paragraph.
+
+    Pass 2 — raw-text-level: if pass 1 finds nothing, scan raw_text for
+    the heading appearing as a word-boundary-delimited token (e.g. embedded
+    as "...REFERENCES [1]...").  Map the character offset back to the first
+    sentence that starts at or after that offset.
+
+    Headings matched: "references", "bibliography", "works cited",
+    "literature cited", "reference list".
+
+    Fallback: if neither pass detects a heading, nothing is marked — avoids
+    false positives on papers with unusual formatting.
+    """
+    import re as _re
+
+    _HEADING_PATTERN = (
+        r"(?:references|bibliography|works\s+cited|"
+        r"literature\s+cited|reference\s+list)"
+    )
+    # Pass 1 — full-sentence heading (standalone line / short sentence)
+    _SENT_RE = _re.compile(
+        r"^\s*" + _HEADING_PATTERN + r"\s*[.:]*\s*$",
+        _re.IGNORECASE,
+    )
+    boundary = None
+    for i, sent in enumerate(sentences):
+        if len(sent) <= 40 and _SENT_RE.match(sent):
+            boundary = i
+            break
+
+    # Pass 2 — heading embedded inline in raw_text (e.g. "...REFERENCES [1]")
+    # Only search the latter 40% of the document to avoid matching the word
+    # "references" in journal title headers, in-body citations, or section
+    # headings that appear early in the paper (e.g. "3. Related References").
+    if boundary is None and raw_text:
+        search_start = int(len(raw_text) * 0.60)
+        tail_text    = raw_text[search_start:]
+        # Require the heading to be preceded by whitespace/punctuation and
+        # followed by either whitespace+digit (citation "[1]") or end-of-word,
+        # to distinguish "REFERENCES" the section heading from "references" used
+        # as a common noun mid-sentence.
+        _TEXT_RE = _re.compile(
+            r"(?:^|[\s.])(" + _HEADING_PATTERN + r")(?=\s*[\[\d\s]|$)",
+            _re.IGNORECASE | _re.MULTILINE,
+        )
+        m = _TEXT_RE.search(tail_text)
+        if m:
+            heading_char = search_start + m.start(1)
+            # Find the sentence whose occurrence in raw_text is closest to
+            # (and at or after) heading_char.  We can't just take the first
+            # sentence in list order whose text appears after heading_char,
+            # because repeated headers/watermarks mean a short sentence may
+            # match a second occurrence later in the text — we want the
+            # sentence positioned nearest to the actual heading.
+            best_i   = None
+            best_pos = len(raw_text) + 1
+            for i, sent in enumerate(sentences):
+                pos = raw_text.find(sent, max(0, heading_char - 5))
+                if pos != -1 and pos >= heading_char and pos < best_pos:
+                    best_pos = pos
+                    best_i   = i
+            if best_i is not None:
+                boundary = best_i
+            # If every sentence-level search missed (heading is run-on),
+            # fall back: find the sentence that *contains* heading_char and
+            # start filtering from the next one.
+            if boundary is None:
+                for i, sent in enumerate(sentences):
+                    pos = raw_text.find(sent)
+                    if pos != -1 and pos <= heading_char < pos + len(sent):
+                        boundary = i + 1
+                        break
+
+    if boundary is not None:
+        for i in range(boundary, len(sentence_meta)):
+            sentence_meta[i]["past_references"] = True
+
+
 def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
     """
     Parse *file_bytes* as a PDF, extract text (layout-aware or pypdf depending
@@ -251,6 +343,12 @@ def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
         )
     else:
         sentence_meta = [{"page": 0}] * len(sentences)
+
+    # Mark sentences that fall after the references/bibliography heading so
+    # select_context can exclude them from the retrieval candidate pool.
+    # This is purely additive — the sentences remain in doc_data["sentences"]
+    # and sentence_meta for debugging/display; only retrieval skips them.
+    _mark_references_section(sentences, sentence_meta, raw_text)
 
     doc_data = {"text": raw_text, "sentences": sentences, "sentence_meta": sentence_meta}
 
