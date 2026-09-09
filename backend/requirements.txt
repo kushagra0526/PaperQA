@@ -10,6 +10,11 @@ python-multipart
 tokenizers
 scikit-learn
 pypdf
+# PyMuPDF: layout-aware PDF extraction (word-level bounding boxes, two-column detection).
+pymupdf
+# nltk sent_tokenize: replaces the regex sentence splitter to handle abbreviations
+# (et al., Fig., e.g.,) and decimal numbers without false splits.
+nltk
 # optimum + transformers: used only at build time (preload.py) for ONNX export and
 # INT8 quantization — not imported in the runtime path (main.py).
 optimum[onnxruntime]
