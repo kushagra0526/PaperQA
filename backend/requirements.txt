@@ -1,3 +1,6 @@
+# Optimum pulls torch transitively for the ONNX export step; this ensures pip
+# resolves the small CPU-only wheel instead of the multi-GB CUDA-bundled one.
+--extra-index-url https://download.pytorch.org/whl/cpu
 fastapi
 uvicorn[standard]
 python-multipart
