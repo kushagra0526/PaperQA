@@ -18,7 +18,6 @@ from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoTokenizer
-from optimum.onnxruntime import ORTModelForQuestionAnswering
 import onnxruntime as ort
 
 # Preserve negation terms that sklearn's built-in "english" stopword list removes.
@@ -70,17 +69,32 @@ def get_model():
                 if os.path.isdir(ONNX_MODEL_DIR):
                     # Load the pre-exported, quantized ONNX model from the build step.
                     tokenizer = AutoTokenizer.from_pretrained(ONNX_MODEL_DIR)
-                    model = ORTModelForQuestionAnswering.from_pretrained(
-                        ONNX_MODEL_DIR,
-                        file_name="model_quantized.onnx",
-                        session_options=session_options
+                    model = ort.InferenceSession(
+                        os.path.join(ONNX_MODEL_DIR, "model_quantized.onnx"),
+                        sess_options=session_options,
+                        providers=["CPUExecutionProvider"],
                     )
                 else:
-                    # Dev fallback: export on-the-fly if preload.py hasn't been run.
+                    # Dev fallback: export + quantize on-the-fly if preload.py
+                    # hasn't been run yet.  Uses optimum only at build time;
+                    # the resulting session is a plain ort.InferenceSession.
+                    from optimum.onnxruntime import ORTModelForQuestionAnswering, ORTQuantizer
+                    from optimum.onnxruntime.configuration import AutoQuantizationConfig
+                    from tempfile import TemporaryDirectory
                     tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
-                    model = ORTModelForQuestionAnswering.from_pretrained(
-                        QA_MODEL_NAME, export=True,
-                        session_options=session_options
+                    with TemporaryDirectory() as tmp_dir:
+                        _ort_model = ORTModelForQuestionAnswering.from_pretrained(
+                            QA_MODEL_NAME, export=True
+                        )
+                        _ort_model.save_pretrained(tmp_dir)
+                        _quantizer = ORTQuantizer.from_pretrained(tmp_dir)
+                        _qconfig = AutoQuantizationConfig.avx2(is_static=False, per_channel=False)
+                        _quantizer.quantize(save_dir=ONNX_MODEL_DIR, quantization_config=_qconfig)
+                    tokenizer.save_pretrained(ONNX_MODEL_DIR)
+                    model = ort.InferenceSession(
+                        os.path.join(ONNX_MODEL_DIR, "model_quantized.onnx"),
+                        sess_options=session_options,
+                        providers=["CPUExecutionProvider"],
                     )
                 gc.collect()
     _last_model_use = time.time()
@@ -198,7 +212,7 @@ def get_answer(question: str, context: str) -> dict:
         return {"answer": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
 
     try:
-        tok, qa_model = get_model()
+        tok, model = get_model()
 
         inputs = tok(
             question,
@@ -217,21 +231,25 @@ def get_answer(question: str, context: str) -> dict:
 
         # ONNX Runtime does not build a computation graph, so no torch.no_grad()
         # context manager is needed.  Inputs and outputs are numpy arrays.
-        outputs = qa_model(
-            input_ids=inputs['input_ids'],
-            attention_mask=inputs['attention_mask']
-        )
+        #
+        # Session inputs:  input_ids, attention_mask, token_type_ids  (all int64)
+        # Session outputs: start_logits, end_logits                   (float32)
+        # Verified via session.get_inputs()/get_outputs() against model_quantized.onnx.
+        input_names = {inp.name for inp in model.get_inputs()}
+        input_feed = {
+            "input_ids":      inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+        }
+        if "token_type_ids" in input_names:
+            input_feed["token_type_ids"] = inputs["token_type_ids"]
 
-        # Verified: with return_tensors='np' and optimum's ORTModelForQuestionAnswering,
-        # outputs.start_logits and outputs.end_logits are numpy.ndarray, not torch.Tensor.
-        # To re-verify after an optimum upgrade:
-        #   assert isinstance(outputs.start_logits, np.ndarray), type(outputs.start_logits)
-        # If a future optimum version wraps outputs as torch tensors for compatibility,
-        # add:  start_logits = outputs.start_logits[0].numpy()
-        #        end_logits  = outputs.end_logits[0].numpy()
+        raw_outputs = model.run(output_names=None, input_feed=input_feed)
 
-        start_logits = outputs.start_logits[0]
-        end_logits = outputs.end_logits[0]
+        # Map outputs by name so the order from get_outputs() doesn't matter.
+        output_names = [out.name for out in model.get_outputs()]
+        output_map = dict(zip(output_names, raw_outputs))
+        start_logits = output_map["start_logits"][0]
+        end_logits   = output_map["end_logits"][0]
 
         null_score = float(start_logits[0] + end_logits[0])
         best_score = float('-inf')
