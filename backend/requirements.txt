@@ -1,24 +1,24 @@
 # Optimum pulls torch transitively for the ONNX export step; this ensures pip
 # resolves the small CPU-only wheel instead of the multi-GB CUDA-bundled one.
 --extra-index-url https://download.pytorch.org/whl/cpu
-fastapi
-uvicorn[standard]
-python-multipart
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32
 # tokenizers: standalone HuggingFace tokenizer library used at runtime in main.py.
 # Replaces transformers.AutoTokenizer to eliminate transformers' conditional torch
 # import (is_torch_available()) from the server process.
-tokenizers
-scikit-learn
-pypdf
+tokenizers==0.22.2
+scikit-learn==1.9.0
+pypdf==6.18.0
 # PyMuPDF: layout-aware PDF extraction (word-level bounding boxes, two-column detection).
-pymupdf
+pymupdf==1.28.2
 # nltk sent_tokenize: replaces the regex sentence splitter to handle abbreviations
 # (et al., Fig., e.g.,) and decimal numbers without false splits.
-nltk
+nltk==3.10.3
 # optimum + transformers: used only at build time (preload.py) for ONNX export and
 # INT8 quantization — not imported in the runtime path (main.py).
-optimum[onnxruntime]
-transformers
-numpy
+optimum[onnxruntime]==2.1.0
+transformers==4.57.6
+numpy==2.4.6
 # requests: used by test_concurrency.py (dev/debug script only — not needed at runtime).
-requests
+requests==2.34.2
