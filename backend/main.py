@@ -19,6 +19,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoTokenizer
 from optimum.onnxruntime import ORTModelForQuestionAnswering
+import onnxruntime as ort
 
 # Preserve negation terms that sklearn's built-in "english" stopword list removes.
 # Stripping "not", "no", "none", "cannot", "never" breaks retrieval for questions
@@ -59,18 +60,27 @@ def get_model():
             # Re-check inside the lock: another thread may have loaded the model
             # between our outer check and acquiring the lock.
             if tokenizer is None or model is None:
+                # Pin ONNX Runtime to single-threaded inference.  The OMP/MKL
+                # env vars at the top of this file do not control ORT's own
+                # thread pool, so without this it may spawn extra threads.
+                session_options = ort.SessionOptions()
+                session_options.intra_op_num_threads = 1
+                session_options.inter_op_num_threads = 1
+
                 if os.path.isdir(ONNX_MODEL_DIR):
                     # Load the pre-exported, quantized ONNX model from the build step.
                     tokenizer = AutoTokenizer.from_pretrained(ONNX_MODEL_DIR)
                     model = ORTModelForQuestionAnswering.from_pretrained(
                         ONNX_MODEL_DIR,
-                        file_name="model_quantized.onnx"
+                        file_name="model_quantized.onnx",
+                        session_options=session_options
                     )
                 else:
                     # Dev fallback: export on-the-fly if preload.py hasn't been run.
                     tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
                     model = ORTModelForQuestionAnswering.from_pretrained(
-                        QA_MODEL_NAME, export=True
+                        QA_MODEL_NAME, export=True,
+                        session_options=session_options
                     )
                 gc.collect()
     _last_model_use = time.time()
@@ -211,6 +221,14 @@ def get_answer(question: str, context: str) -> dict:
             input_ids=inputs['input_ids'],
             attention_mask=inputs['attention_mask']
         )
+
+        # Verified: with return_tensors='np' and optimum's ORTModelForQuestionAnswering,
+        # outputs.start_logits and outputs.end_logits are numpy.ndarray, not torch.Tensor.
+        # To re-verify after an optimum upgrade:
+        #   assert isinstance(outputs.start_logits, np.ndarray), type(outputs.start_logits)
+        # If a future optimum version wraps outputs as torch tensors for compatibility,
+        # add:  start_logits = outputs.start_logits[0].numpy()
+        #        end_logits  = outputs.end_logits[0].numpy()
 
         start_logits = outputs.start_logits[0]
         end_logits = outputs.end_logits[0]
