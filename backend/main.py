@@ -586,67 +586,122 @@ def rerank_windows(question: str, windows: list[str]) -> list[str]:
 
 
 def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
+    """
+    Public API used by tests and legacy callers.  Returns the assembled context
+    string, or "" if no relevant passage was found.  See select_context_with_meta
+    for the richer return value used by the /ask endpoint.
+    """
+    result = select_context_with_meta(doc_data, question, top_n=top_n)
+    return result["context"]
+
+
+def select_context_with_meta(doc_data: dict, question: str, top_n: int = 5) -> dict:
+    """
+    Retrieve the most relevant windows for *question* from *doc_data*, apply
+    score-threshold pruning, and (optionally) rerank.
+
+    Returns a dict:
+      {
+        "context":              str,    # assembled context string ('' if not found)
+        "retrieval_confidence": float,  # top candidate's normalised score [0, 1]
+        "found":                bool,   # False → no passage cleared the threshold
+      }
+
+    Retrieval cutoff (replaces the old fixed top_n):
+      - Score every window with TF-IDF cosine similarity.
+      - Keep only windows whose score is >= the 40th percentile of *that query's*
+        score distribution across all windows.
+      - Hard bounds: at least 1 window (unless all windows score 0), at most 8.
+      - If zero windows survive (all scores are 0 or the distribution is flat),
+        treat this as "no relevant passage" and return found=False immediately,
+        without calling the QA model.
+
+    retrieval_confidence:
+      The top candidate's TF-IDF score normalised to [0, 1] by the max score
+      seen across all windows for this query.  After reranking, this remains
+      the TF-IDF top score (the cross-encoder score is on a different scale and
+      not exposed here; its effect is already reflected in which windows are
+      selected).
+    """
     sentences = doc_data.get("sentences", [])
     if not sentences:
-        return ""
-    if len(sentences) <= top_n:
-        return ' '.join(sentences)
+        return {"context": "", "retrieval_confidence": 0.0, "found": False}
 
-    # Build overlapping 3-sentence windows so each retrieval unit carries more
-    # context than a single sentence, improving TF-IDF recall for questions
-    # whose answer spans a sentence boundary.
-    # TODO: each window is now ~3x longer than a bare sentence; concatenating
-    # top_n=5 windows can approach or exceed the 512-token budget passed to the
-    # ONNX model — evaluate actual token counts in eval and consider reducing
-    # top_n or trimming the concatenated context if truncation becomes frequent.
     windows = build_windows(sentences)
 
-    # When USE_RERANKER is True, widen the initial candidate pool so the
-    # cross-encoder has a larger shortlist to work with.  The reranker's
-    # higher-precision scoring replaces the TF-IDF ordering entirely, so
-    # retrieving more candidates here improves recall without hurting precision.
-    # When USE_RERANKER is False, candidate_n == top_n and behaviour is
-    # identical to the pre-reranker code path.
-    candidate_n = RERANKER_CANDIDATES if USE_RERANKER else top_n
-
+    # ------------------------------------------------------------------ #
+    # Score all windows with TF-IDF cosine similarity.                    #
+    # ------------------------------------------------------------------ #
     try:
-        # TF-IDF is used here instead of a neural embedding model because it needs
-        # only ~1MB of RAM and runs in under 1ms, avoiding the multi-hundred-MB
-        # memory spike that sentence-transformers would cause on memory-constrained hosts.
         vectorizer = TfidfVectorizer(stop_words=CUSTOM_STOPWORDS)
         tfidf_matrix = vectorizer.fit_transform([question] + windows)
-        scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
-        retrieve_n = min(candidate_n, len(scores))
-        top_idx = sorted(
-            sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:retrieve_n]
-        )
-        candidates = [windows[i] for i in top_idx]
+        raw_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
     except Exception:
-        candidates = windows[:candidate_n]
+        # TF-IDF failure (e.g. all-stopword question): fall back to first window.
+        return {
+            "context": windows[0] if windows else "",
+            "retrieval_confidence": 0.0,
+            "found": bool(windows),
+        }
 
+    max_score = float(raw_scores.max()) if len(raw_scores) else 0.0
+
+    # ------------------------------------------------------------------ #
+    # Score-threshold pruning: 40th-percentile floor, bounds [1, 8].     #
+    # ------------------------------------------------------------------ #
+    if max_score == 0.0:
+        # Every window scored 0 — no vocabulary overlap with the question.
+        return {"context": "", "retrieval_confidence": 0.0, "found": False}
+
+    threshold = float(np.percentile(raw_scores, 40))
+    MAX_CANDIDATES = 8
+    MIN_CANDIDATES = 1
+
+    # Sort descending by score, apply threshold, then enforce bounds.
+    ranked_idx = sorted(range(len(raw_scores)), key=lambda i: raw_scores[i], reverse=True)
+    above = [i for i in ranked_idx if raw_scores[i] >= threshold]
+
+    # Clamp to [MIN_CANDIDATES, MAX_CANDIDATES].
+    if len(above) < MIN_CANDIDATES:
+        above = ranked_idx[:MIN_CANDIDATES]
+    elif len(above) > MAX_CANDIDATES:
+        above = above[:MAX_CANDIDATES]
+
+    # Normalised top-candidate score for retrieval_confidence.
+    retrieval_confidence = round(float(raw_scores[above[0]]) / max_score, 4)
+
+    # Widen the pool further when reranking so the cross-encoder sees more candidates.
+    if USE_RERANKER and len(above) < RERANKER_CANDIDATES:
+        extra = [i for i in ranked_idx if i not in set(above)]
+        above = above + extra[: RERANKER_CANDIDATES - len(above)]
+
+    # Restore document order for the non-reranker path (preserves reading coherence).
+    candidates = [windows[i] for i in sorted(above)]
+
+    # ------------------------------------------------------------------ #
+    # Fast path: no reranking.                                            #
+    # ------------------------------------------------------------------ #
     if not USE_RERANKER:
-        # Fast path: no reranking, return TF-IDF top-n joined in document order.
-        return ' '.join(candidates)
+        return {
+            "context": " ".join(candidates),
+            "retrieval_confidence": retrieval_confidence,
+            "found": True,
+        }
 
-    # Reranking path: cross-encoder re-scores and prunes the candidate list.
-    # rerank_windows() returns windows best-first; we join them in that order
-    # (best relevance first) so the QA model sees the strongest evidence early.
-    # Token-budget guard: add windows greedily in score order until the
-    # assembled context + question would approach the 512-token limit.
-    # This prevents the tokenizer's built-in truncation from silently discarding
-    # whichever reranked window happens to sit at the tail of the concatenation.
+    # ------------------------------------------------------------------ #
+    # Reranking path (USE_RERANKER=True).                                 #
+    # ------------------------------------------------------------------ #
     reranked = rerank_windows(question, candidates)
 
     TOKEN_BUDGET = 480  # 512 minus ~32 for special tokens
     selected_windows: list[str] = []
     cumulative_tokens = 0
     for window in reranked:
-        # Use the QA tokenizer (already loaded) to count tokens for this window.
         try:
             tok, _ = get_model()
             window_tokens = len(tok.encode(window).ids)
         except Exception:
-            window_tokens = len(window.split()) * 2  # rough fallback estimate
+            window_tokens = len(window.split()) * 2
         if cumulative_tokens + window_tokens > TOKEN_BUDGET:
             break
         selected_windows.append(window)
@@ -655,7 +710,11 @@ def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
     if not selected_windows:
         selected_windows = reranked[:1]
 
-    return ' '.join(selected_windows)
+    return {
+        "context": " ".join(selected_windows),
+        "retrieval_confidence": retrieval_confidence,
+        "found": True,
+    }
 
 
 def extract_fallback_span(question: str, context: str) -> dict:
@@ -799,42 +858,52 @@ def health():
 def ask(file: UploadFile = File(...), question: str = Form(...)):
     try:
         if not question or not question.strip():
-            return {"answer": "", "context": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
+            return {
+                "answer": "", "context": "", "char_start": -1, "char_end": -1,
+                "confidence": 0.0, "found": False, "retrieval_confidence": 0.0,
+            }
 
         file.file.seek(0)
         file_bytes = file.file.read()
         if not file_bytes:
-            return {"answer": "", "context": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
+            return {
+                "answer": "", "context": "", "char_start": -1, "char_end": -1,
+                "confidence": 0.0, "found": False, "retrieval_confidence": 0.0,
+            }
 
         if len(file_bytes) > 20_000_000:
             return {
-                "answer": "",
-                "context": "",
-                "char_start": -1,
-                "char_end": -1,
-                "confidence": 0.0,
-                "found": False,
-                "error": "File too large (max 20MB)."
+                "answer": "", "context": "", "char_start": -1, "char_end": -1,
+                "confidence": 0.0, "found": False, "retrieval_confidence": 0.0,
+                "error": "File too large (max 20MB).",
             }
 
         doc_data = extract_and_chunk_pdf(file_bytes)
-        context = select_context(doc_data, question)
+        retrieval = select_context_with_meta(doc_data, question)
+
+        # If retrieval found no passage above the relevance threshold, return
+        # immediately without invoking the QA model — there is nothing to extract.
+        if not retrieval["found"]:
+            return {
+                "answer": "", "context": "", "char_start": -1, "char_end": -1,
+                "confidence": 0.0, "found": False,
+                "retrieval_confidence": retrieval["retrieval_confidence"],
+            }
+
+        context = retrieval["context"]
         qa_res = get_answer(question, context)
         return {
-            "answer": qa_res.get("answer", ""),
-            "context": context,
-            "char_start": qa_res.get("char_start", -1),
-            "char_end": qa_res.get("char_end", -1),
-            "confidence": qa_res.get("confidence", 0.0),
-            "found": qa_res.get("found", False)
+            "answer":               qa_res.get("answer", ""),
+            "context":              context,
+            "char_start":           qa_res.get("char_start", -1),
+            "char_end":             qa_res.get("char_end", -1),
+            "confidence":           qa_res.get("confidence", 0.0),
+            "found":                qa_res.get("found", False),
+            "retrieval_confidence": retrieval["retrieval_confidence"],
         }
     except Exception as exc:
         return {
-            "answer": "",
-            "context": f"Error processing document: {str(exc)}",
-            "char_start": -1,
-            "char_end": -1,
-            "confidence": 0.0,
-            "found": False,
-            "error": str(exc)
+            "answer": "", "context": f"Error processing document: {str(exc)}",
+            "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False,
+            "retrieval_confidence": 0.0, "error": str(exc),
         }
