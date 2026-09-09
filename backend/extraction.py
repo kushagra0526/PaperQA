@@ -54,6 +54,128 @@ _cache_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
+# Two-column gutter detection
+# ---------------------------------------------------------------------------
+
+# A gutter must be wider than ordinary inter-word spacing by at least this
+# multiple of the page's own median word gap, and at least this many points
+# absolute — both guards matter: the multiple alone would false-positive on
+# pages with almost no spacing information, and the absolute floor alone
+# would false-positive on pages set in an unusually loose font.
+_GUTTER_MEDIAN_MULTIPLE = 4.0
+_GUTTER_MIN_ABSOLUTE_PT = 12.0
+
+# A candidate gutter location must recur at a consistent x-position across
+# at least this fraction of lines that have enough words to reveal a gap at
+# all — a single line's coincidental wide space (e.g. before an en-dash, or
+# a short line at a paragraph end) must not be enough on its own.
+_GUTTER_MIN_LINE_FRACTION = 0.5
+_GUTTER_TOLERANCE_PT = 20.0
+
+
+def _detect_column_gutter(words: list[tuple]) -> float | None:
+    """
+    Decide whether *words* (one page's ``page.get_text("words")`` output)
+    come from a genuine multi-column layout, and if so return the gutter's
+    x-coordinate — the vertical band consistently free of word content that
+    separates the columns.  Returns None when no such stable gutter exists,
+    meaning the page should be treated as an ordinary single column.
+
+    This replaces a purely aggregate check ("some words are left of the
+    page's horizontal midpoint, some are right") which false-positives on
+    almost any single-column page: a normal paragraph column with standard
+    margins straddles the page's horizontal center on nearly every line, so
+    roughly half its words fall on each side by construction — that is not
+    evidence of two columns.
+
+    A genuine gutter instead shows up as an unusually wide gap *within
+    individual rows*, at the *same x-position across most rows* — a
+    single-column page's line-wrapping point moves around from line to
+    line, so it essentially never produces a gap at a consistent location.
+
+    Rows are built from raw y-coordinates spanning the *whole page width*,
+    not from PyMuPDF's own (block_no, line_no) tags: a genuine two-column
+    layout is normally reported as two separate text blocks (one per
+    column), so grouping by block first would put every column's words in
+    their own line group and the two columns could never be compared
+    against each other — there would be no gap to find, because no row
+    would ever contain words from both columns to begin with.
+    """
+    if not words:
+        return None
+
+    # Cluster words into rows by y0 alone, tolerant of the small baseline
+    # jitter within one visual line but tight enough not to merge adjacent
+    # lines — calibrated from this page's own median word height so it
+    # adapts to font size instead of assuming one.
+    by_y = sorted(words, key=lambda w: w[1])
+    heights = [w[3] - w[1] for w in by_y if w[3] > w[1]]
+    heights.sort()
+    row_tolerance = max((heights[len(heights) // 2] * 0.5) if heights else 3.0, 1.5)
+
+    lines: list[list[tuple]] = []
+    current: list[tuple] = [by_y[0]]
+    row_anchor = by_y[0][1]
+    for w in by_y[1:]:
+        if abs(w[1] - row_anchor) <= row_tolerance:
+            current.append(w)
+        else:
+            lines.append(current)
+            current = [w]
+            row_anchor = w[1]
+    lines.append(current)
+
+    # Calibrate "unusually wide" against this page's own typical inter-word
+    # spacing rather than a fixed constant, so it adapts to font size.
+    normal_gaps: list[float] = []
+    for line_words in lines:
+        ordered = sorted(line_words, key=lambda w: w[0])
+        for a, b in zip(ordered, ordered[1:]):
+            gap = b[0] - a[2]
+            if gap > 0:
+                normal_gaps.append(gap)
+    if not normal_gaps:
+        return None
+    normal_gaps.sort()
+    median_gap = normal_gaps[len(normal_gaps) // 2]
+    gutter_threshold = max(median_gap * _GUTTER_MEDIAN_MULTIPLE, _GUTTER_MIN_ABSOLUTE_PT)
+
+    # For each line with enough words to show an internal gap, record the
+    # center of its single widest gap (if any) that clears the threshold.
+    candidate_centers: list[float] = []
+    eligible_lines = 0
+    for line_words in lines:
+        ordered = sorted(line_words, key=lambda w: w[0])
+        if len(ordered) < 2:
+            continue
+        eligible_lines += 1
+        widest: tuple[float, float, float] | None = None   # (start, end, size)
+        for a, b in zip(ordered, ordered[1:]):
+            gap_start, gap_end = a[2], b[0]
+            gap = gap_end - gap_start
+            if gap >= gutter_threshold and (widest is None or gap > widest[2]):
+                widest = (gap_start, gap_end, gap)
+        if widest is not None:
+            candidate_centers.append((widest[0] + widest[1]) / 2.0)
+
+    # Need enough multi-word lines to say anything meaningful, and at least
+    # one candidate gap at all.
+    if eligible_lines < 3 or not candidate_centers:
+        return None
+
+    # The gutter location must recur consistently, not just appear once.
+    candidate_centers.sort()
+    median_center = candidate_centers[len(candidate_centers) // 2]
+    consistent = [
+        c for c in candidate_centers if abs(c - median_center) <= _GUTTER_TOLERANCE_PT
+    ]
+    if len(consistent) / eligible_lines < _GUTTER_MIN_LINE_FRACTION:
+        return None
+
+    return sum(consistent) / len(consistent)
+
+
+# ---------------------------------------------------------------------------
 # Layout-aware extraction (PyMuPDF)
 # ---------------------------------------------------------------------------
 
@@ -61,11 +183,13 @@ def extract_text_layout_aware(file_bytes: bytes) -> tuple[str, list[int], list[s
     """
     Extract text from a PDF using PyMuPDF with layout-aware word ordering.
 
-    For each page, word bounding boxes are used to detect two-column layout.
-    Two-column detection: if a meaningful fraction of words cluster to the left
-    of the page midpoint AND a meaningful fraction cluster to the right, the page
-    is treated as two-column and words are sorted left-column-first, then right.
-    Single-column pages are sorted by (y0, x0) as normal reading order.
+    For each page, word bounding boxes are used to detect two-column layout
+    via _detect_column_gutter: a genuine, consistently-positioned gap between
+    columns, not merely "some words left of center, some right" (see that
+    function's docstring for why the naive aggregate check false-positives on
+    ordinary single-column pages).  When a stable gutter is found, words are
+    split at it and sorted left-column-first, then right.  Otherwise the page
+    is single-column and words are sorted by (y0, x0) as normal reading order.
 
     Returns:
         raw_text        — all pages joined by spaces (matches pypdf format).
@@ -95,19 +219,11 @@ def extract_text_layout_aware(file_bytes: bytes) -> tuple[str, list[int], list[s
             if not words:
                 continue
 
-            mid_x = page.rect.width / 2.0
-            left_words  = [w for w in words if w[0] < mid_x]
-            right_words = [w for w in words if w[0] >= mid_x]
+            gutter_x = _detect_column_gutter(words)
 
-            # Two-column heuristic: both halves must each hold ≥15% of words.
-            total = len(words)
-            is_two_column = (
-                total > 0
-                and len(left_words) / total >= 0.15
-                and len(right_words) / total >= 0.15
-            )
-
-            if is_two_column:
+            if gutter_x is not None:
+                left_words  = [w for w in words if w[0] < gutter_x]
+                right_words = [w for w in words if w[0] >= gutter_x]
                 ordered = (
                     sorted(left_words,  key=lambda w: (w[1], w[0]))
                     + sorted(right_words, key=lambda w: (w[1], w[0]))
