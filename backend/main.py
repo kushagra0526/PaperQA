@@ -43,14 +43,47 @@ app = FastAPI(title="Scientific Paper QA")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 QA_MODEL_NAME = "deepset/minilm-uncased-squad2"
+RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
 # Local directory where preload.py saves the ONNX-exported, INT8-quantized model
 # during the build step.  At runtime, get_model() loads from here if available.
-ONNX_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "onnx_model")
+ONNX_MODEL_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "onnx_model")
+ONNX_RERANKER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "onnx_reranker")
 
 # When True, extract_and_chunk_pdf uses the layout-aware PyMuPDF path
 # (extract_text_layout_aware) which handles two-column papers correctly.
 # Set to False to fall back to the original pypdf-based extraction.
 USE_LAYOUT_AWARE_EXTRACTION = True
+
+# Controls which retrieval strategy select_context uses to build the candidate
+# window shortlist before (optionally) reranking.
+#   "tfidf"  — TF-IDF cosine similarity only (default, zero extra memory)
+#   "dense"  — dense bi-encoder retrieval (requires embedding model in memory)
+#   "hybrid" — RRF fusion of TF-IDF + dense scores
+# Only "tfidf" is fully implemented in this pass; the flag is wired so that
+# adding dense/hybrid later only requires filling in the retrieval path.
+RETRIEVAL_MODE = "tfidf"
+
+# When True, the top-N candidates from RETRIEVAL_MODE are re-scored and
+# re-sorted by a cross-encoder before being passed to the QA model.
+# Set to False (default) to skip reranking entirely — the reranker model is
+# never loaded when this flag is False, keeping memory usage unchanged.
+USE_RERANKER = False
+
+# Number of candidate windows to retrieve before reranking.  Only used when
+# USE_RERANKER is True; otherwise select_context uses top_n directly.
+RERANKER_CANDIDATES = 20
+
+# Reranker score margin: windows whose score is within this many logit units of
+# the top score are kept.  Enforces MIN_RERANKED / MAX_RERANKED bounds.
+RERANKER_MARGIN   = 2.0
+MIN_RERANKED      = 1
+MAX_RERANKED      = 4
+
+# Absolute score floor: if the top reranker score is below this threshold the
+# reranker considers no window sufficiently relevant and the fallback path in
+# select_context returns the raw top-1 TF-IDF candidate instead.
+RERANKER_SCORE_FLOOR = -5.0
 
 tokenizer = None
 model = None
@@ -68,6 +101,16 @@ _model_lock = threading.Lock()
 # Lock protecting all mutations to DOC_CACHE (eviction + insertion) because
 # dict.pop() and key assignment are not atomic across threads in all Python builds.
 _cache_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Reranker model state — independent of the QA model.
+# Only ever loaded when USE_RERANKER is True; a tfidf-mode request with
+# USE_RERANKER=False never touches these globals.
+# ---------------------------------------------------------------------------
+_reranker_tokenizer = None   # tokenizers.Tokenizer for the cross-encoder
+_reranker_session   = None   # ort.InferenceSession for the cross-encoder
+_last_reranker_use  = 0.0
+_reranker_lock      = threading.Lock()
 
 
 def get_model():
@@ -127,6 +170,60 @@ def get_model():
     return tokenizer, model
 
 
+def get_reranker():
+    """
+    Lazy-load the ONNX cross-encoder reranker under a double-checked lock,
+    mirroring get_model()'s pattern exactly.  Returns (tokenizer, session).
+
+    Only called when USE_RERANKER is True — a tfidf-mode request that doesn't
+    need the reranker never enters this function, so the reranker model is
+    never loaded into memory in that case.
+    """
+    global _reranker_tokenizer, _reranker_session, _last_reranker_use
+    if _reranker_tokenizer is None or _reranker_session is None:
+        with _reranker_lock:
+            if _reranker_tokenizer is None or _reranker_session is None:
+                sess_options = ort.SessionOptions()
+                sess_options.intra_op_num_threads = 1
+                sess_options.inter_op_num_threads = 1
+
+                if os.path.isdir(ONNX_RERANKER_DIR):
+                    _tok_path = os.path.join(ONNX_RERANKER_DIR, "tokenizer.json")
+                    _reranker_tokenizer = Tokenizer.from_file(_tok_path)
+                    _reranker_tokenizer.enable_truncation(max_length=512)
+                    _reranker_session = ort.InferenceSession(
+                        os.path.join(ONNX_RERANKER_DIR, "model_quantized.onnx"),
+                        sess_opts=sess_options,
+                        providers=["CPUExecutionProvider"],
+                    )
+                else:
+                    # Dev fallback: export + quantize on-the-fly.
+                    from optimum.onnxruntime import ORTModelForSequenceClassification, ORTQuantizer
+                    from optimum.onnxruntime.configuration import AutoQuantizationConfig
+                    from transformers import AutoTokenizer as _AutoTokenizer
+                    from tempfile import TemporaryDirectory
+                    with TemporaryDirectory() as tmp_dir:
+                        _m = ORTModelForSequenceClassification.from_pretrained(
+                            RERANKER_MODEL_NAME, export=True
+                        )
+                        _m.save_pretrained(tmp_dir)
+                        _q = ORTQuantizer.from_pretrained(tmp_dir)
+                        _qcfg = AutoQuantizationConfig.avx2(is_static=False, per_channel=False)
+                        _q.quantize(save_dir=ONNX_RERANKER_DIR, quantization_config=_qcfg)
+                    _AutoTokenizer.from_pretrained(RERANKER_MODEL_NAME).save_pretrained(ONNX_RERANKER_DIR)
+                    _tok_path = os.path.join(ONNX_RERANKER_DIR, "tokenizer.json")
+                    _reranker_tokenizer = Tokenizer.from_file(_tok_path)
+                    _reranker_tokenizer.enable_truncation(max_length=512)
+                    _reranker_session = ort.InferenceSession(
+                        os.path.join(ONNX_RERANKER_DIR, "model_quantized.onnx"),
+                        sess_opts=sess_options,
+                        providers=["CPUExecutionProvider"],
+                    )
+                gc.collect()
+    _last_reranker_use = time.time()
+    return _reranker_tokenizer, _reranker_session
+
+
 def _numpy_softmax(x):
     """Numerically stable softmax over a 1-D numpy array."""
     e_x = np.exp(x - np.max(x))
@@ -156,6 +253,28 @@ def _idle_unload_loop():
 # Background daemon that reclaims model memory after 10 minutes of inactivity.
 # The existing lazy-loading in get_model() will reload it on the next request.
 threading.Thread(target=_idle_unload_loop, daemon=True).start()
+
+
+def _reranker_idle_unload_loop():
+    """
+    Periodically evicts the reranker from memory when idle, mirroring the QA
+    model's _idle_unload_loop.  Only worth checking when USE_RERANKER is True,
+    but the loop is harmless when it's False (the globals stay None permanently).
+    """
+    global _reranker_tokenizer, _reranker_session
+    while True:
+        time.sleep(120)
+        if _reranker_session is not None and \
+                (time.time() - _last_reranker_use) > _MODEL_IDLE_TIMEOUT:
+            with _reranker_lock:
+                if _reranker_session is not None and \
+                        (time.time() - _last_reranker_use) > _MODEL_IDLE_TIMEOUT:
+                    _reranker_tokenizer = None
+                    _reranker_session   = None
+                    gc.collect()
+
+
+threading.Thread(target=_reranker_idle_unload_loop, daemon=True).start()
 
 
 def extract_text_layout_aware(file_bytes: bytes) -> tuple[str, list[dict]]:
@@ -380,6 +499,92 @@ def build_windows(sentences: list[str]) -> list[str]:
     return windows
 
 
+def rerank_windows(question: str, windows: list[str]) -> list[str]:
+    """
+    Score each (question, window) pair with the ONNX cross-encoder and return
+    windows sorted by descending relevance score, pruned by a score-gap
+    margin and an absolute score floor.
+
+    Scoring:
+      - Tokenize each pair with the reranker's own tokenizer (truncated to 512).
+      - Run a single batched ort.InferenceSession.run() call — all pairs in one
+        call rather than a Python loop, so ORT can exploit any intra-batch
+        parallelism and we pay the Python overhead only once.
+      - The session output is a single [batch, 1] or [batch] logit tensor;
+        higher logit = more relevant.  No sigmoid/softmax needed for ranking.
+
+    Cutoff (consistent with the spec's "better version"):
+      - Keep windows whose score is within RERANKER_MARGIN logit units of the
+        top score (i.e. score >= top_score - RERANKER_MARGIN).
+      - Hard bounds: always keep at least MIN_RERANKED, at most MAX_RERANKED.
+      - If the top score is below RERANKER_SCORE_FLOOR (absolute floor), the
+        reranker considers no window relevant enough; fall back to returning the
+        single best window from the input order rather than forcing low-signal
+        context through.
+
+    Returns the final ordered list of window strings (best-first).
+    """
+    if not windows:
+        return windows
+
+    try:
+        rtok, rsess = get_reranker()
+
+        # Build a batched numpy input: shape [n_pairs, seq_len] padded to the
+        # longest encoded sequence in this batch.
+        encodings = [rtok.encode(question, w) for w in windows]
+        max_len = max(len(e.ids) for e in encodings)
+
+        ids_batch   = np.zeros((len(encodings), max_len), dtype=np.int64)
+        mask_batch  = np.zeros((len(encodings), max_len), dtype=np.int64)
+        ttids_batch = np.zeros((len(encodings), max_len), dtype=np.int64)
+
+        for i, enc in enumerate(encodings):
+            n = len(enc.ids)
+            ids_batch[i, :n]   = enc.ids
+            mask_batch[i, :n]  = enc.attention_mask
+            ttids_batch[i, :n] = enc.type_ids
+
+        input_names = {inp.name for inp in rsess.get_inputs()}
+        input_feed: dict = {
+            "input_ids":      ids_batch,
+            "attention_mask": mask_batch,
+        }
+        if "token_type_ids" in input_names:
+            input_feed["token_type_ids"] = ttids_batch
+
+        raw_out = rsess.run(output_names=None, input_feed=input_feed)
+
+        # Output shape is [batch, 1] for binary classifiers or [batch] for
+        # regression heads — flatten to a 1-D array either way.
+        scores = np.array(raw_out[0], dtype=np.float32).flatten()
+
+        top_score = float(scores.max())
+
+        # Absolute floor: if even the best window is irrelevant, return it alone
+        # rather than concatenating multiple low-signal windows.
+        if top_score < RERANKER_SCORE_FLOOR:
+            best_idx = int(scores.argmax())
+            return [windows[best_idx]]
+
+        # Score-gap margin cutoff with MIN/MAX bounds.
+        ranked = sorted(range(len(windows)), key=lambda i: scores[i], reverse=True)
+        selected: list[str] = []
+        for rank_pos, win_idx in enumerate(ranked):
+            if rank_pos >= MAX_RERANKED:
+                break
+            if rank_pos >= MIN_RERANKED and \
+                    (top_score - float(scores[win_idx])) > RERANKER_MARGIN:
+                break
+            selected.append(windows[win_idx])
+
+        return selected if selected else [windows[ranked[0]]]
+
+    except Exception:
+        # Reranker failure must never break the request — return input unchanged.
+        return windows
+
+
 def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
     sentences = doc_data.get("sentences", [])
     if not sentences:
@@ -396,6 +601,14 @@ def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
     # top_n or trimming the concatenated context if truncation becomes frequent.
     windows = build_windows(sentences)
 
+    # When USE_RERANKER is True, widen the initial candidate pool so the
+    # cross-encoder has a larger shortlist to work with.  The reranker's
+    # higher-precision scoring replaces the TF-IDF ordering entirely, so
+    # retrieving more candidates here improves recall without hurting precision.
+    # When USE_RERANKER is False, candidate_n == top_n and behaviour is
+    # identical to the pre-reranker code path.
+    candidate_n = RERANKER_CANDIDATES if USE_RERANKER else top_n
+
     try:
         # TF-IDF is used here instead of a neural embedding model because it needs
         # only ~1MB of RAM and runs in under 1ms, avoiding the multi-hundred-MB
@@ -403,11 +616,46 @@ def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
         vectorizer = TfidfVectorizer(stop_words=CUSTOM_STOPWORDS)
         tfidf_matrix = vectorizer.fit_transform([question] + windows)
         scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
-        top_n_count = min(top_n, len(scores))
-        top_idx = sorted(sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n_count])
-        return ' '.join(windows[i] for i in top_idx)
+        retrieve_n = min(candidate_n, len(scores))
+        top_idx = sorted(
+            sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:retrieve_n]
+        )
+        candidates = [windows[i] for i in top_idx]
     except Exception:
-        return ' '.join(windows[:top_n])
+        candidates = windows[:candidate_n]
+
+    if not USE_RERANKER:
+        # Fast path: no reranking, return TF-IDF top-n joined in document order.
+        return ' '.join(candidates)
+
+    # Reranking path: cross-encoder re-scores and prunes the candidate list.
+    # rerank_windows() returns windows best-first; we join them in that order
+    # (best relevance first) so the QA model sees the strongest evidence early.
+    # Token-budget guard: add windows greedily in score order until the
+    # assembled context + question would approach the 512-token limit.
+    # This prevents the tokenizer's built-in truncation from silently discarding
+    # whichever reranked window happens to sit at the tail of the concatenation.
+    reranked = rerank_windows(question, candidates)
+
+    TOKEN_BUDGET = 480  # 512 minus ~32 for special tokens
+    selected_windows: list[str] = []
+    cumulative_tokens = 0
+    for window in reranked:
+        # Use the QA tokenizer (already loaded) to count tokens for this window.
+        try:
+            tok, _ = get_model()
+            window_tokens = len(tok.encode(window).ids)
+        except Exception:
+            window_tokens = len(window.split()) * 2  # rough fallback estimate
+        if cumulative_tokens + window_tokens > TOKEN_BUDGET:
+            break
+        selected_windows.append(window)
+        cumulative_tokens += window_tokens
+
+    if not selected_windows:
+        selected_windows = reranked[:1]
+
+    return ' '.join(selected_windows)
 
 
 def extract_fallback_span(question: str, context: str) -> dict:
