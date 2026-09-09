@@ -1,5 +1,6 @@
 import os
-# ponytail: lock worker threads to 1 to eliminate multi-threading memory pool overhead on 512MB RAM hosts
+# Disable parallelism in tokenizers and cap CPU threads to 1 to avoid memory pool
+# fragmentation in multi-threaded environments, which matters especially on low-RAM hosts.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -7,14 +8,21 @@ os.environ["MKL_NUM_THREADS"] = "1"
 import gc
 import hashlib
 import re
+import threading
 from io import BytesIO
 import torch
 from fastapi import FastAPI, UploadFile, Form, File
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoTokenizer, AutoModelForQuestionAnswering
+
+# Preserve negation terms that sklearn's built-in "english" stopword list removes.
+# Stripping "not", "no", "none", "cannot", "never" breaks retrieval for questions
+# like "What does NOT apply?" or context sentences that contain negations.
+NEGATIONS = {"not", "no", "none", "cannot", "never"}
+CUSTOM_STOPWORDS = list(ENGLISH_STOP_WORDS - NEGATIONS)
 
 app = FastAPI(title="Scientific Paper QA")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -24,22 +32,36 @@ tokenizer = None
 model = None
 DOC_CACHE = {}
 
+# Lock protecting lazy model initialisation so that concurrent FastAPI threadpool
+# workers cannot trigger duplicate downloads or simultaneous model loads.
+_model_lock = threading.Lock()
+
+# Lock protecting all mutations to DOC_CACHE (eviction + insertion) because
+# dict.pop() and key assignment are not atomic across threads in all Python builds.
+_cache_lock = threading.Lock()
+
 
 def get_model():
     global tokenizer, model
+    # First check without the lock for the common hot-path where model is already loaded.
     if tokenizer is None or model is None:
-        tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
-        model = AutoModelForQuestionAnswering.from_pretrained(
-            QA_MODEL_NAME,
-            low_cpu_mem_usage=True
-        )
-        model.eval()
-        gc.collect()
+        with _model_lock:
+            # Re-check inside the lock: another thread may have loaded the model
+            # between our outer check and acquiring the lock.
+            if tokenizer is None or model is None:
+                tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
+                model = AutoModelForQuestionAnswering.from_pretrained(
+                    QA_MODEL_NAME,
+                    low_cpu_mem_usage=True
+                )
+                model.eval()
+                gc.collect()
     return tokenizer, model
 
 
-# ponytail: non-blocking background thread warms up model into RAM immediately after port binds
-import threading
+# Start a daemon thread immediately after the server process starts so the model
+# is loaded into RAM before the first real request arrives, avoiding a cold-start
+# latency spike for the initial user.
 threading.Thread(target=get_model, daemon=True).start()
 
 
@@ -62,9 +84,12 @@ def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
 
     doc_data = {"text": raw_text, "sentences": sentences}
 
-    if len(DOC_CACHE) >= 10:
-        DOC_CACHE.pop(next(iter(DOC_CACHE)))
-    DOC_CACHE[pdf_hash] = doc_data
+    # Guard cache eviction and insertion together so no other thread can observe
+    # a half-updated cache state or evict an entry another thread just inserted.
+    with _cache_lock:
+        if len(DOC_CACHE) >= 10:
+            DOC_CACHE.pop(next(iter(DOC_CACHE)))
+        DOC_CACHE[pdf_hash] = doc_data
     return doc_data
 
 
@@ -76,8 +101,10 @@ def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
         return ' '.join(sentences)
 
     try:
-        # ponytail: TF-IDF retrieval uses ~1MB RAM and 0.001s, completely eliminating SentenceTransformers RAM spike.
-        vectorizer = TfidfVectorizer(stop_words='english')
+        # TF-IDF is used here instead of a neural embedding model because it needs
+        # only ~1MB of RAM and runs in under 1ms, avoiding the multi-hundred-MB
+        # memory spike that sentence-transformers would cause on memory-constrained hosts.
+        vectorizer = TfidfVectorizer(stop_words=CUSTOM_STOPWORDS)
         tfidf_matrix = vectorizer.fit_transform([question] + sentences)
         scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
         top_n_count = min(top_n, len(scores))
@@ -88,12 +115,14 @@ def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
 
 
 def extract_fallback_span(question: str, context: str) -> dict:
-    # ponytail: fast zero-memory keyword span fallback if model loading is delayed
+    # Keyword-based TF-IDF fallback that returns a best-matching sentence span when
+    # the main QA model is unavailable or confidence is too low. Requires no model
+    # weights in memory and completes in microseconds.
     try:
         sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', context) if len(s.strip()) > 10]
         if not sentences:
             sentences = [context]
-        vectorizer = TfidfVectorizer(stop_words='english')
+        vectorizer = TfidfVectorizer(stop_words=CUSTOM_STOPWORDS)
         tfidf = vectorizer.fit_transform([question] + sentences)
         scores = cosine_similarity(tfidf[0:1], tfidf[1:]).flatten()
         best_idx = int(scores.argmax())
@@ -204,7 +233,8 @@ def health():
     return {"status": "ok", "cached_docs": len(DOC_CACHE)}
 
 
-# ponytail: accept both POST / and POST /ask to handle whatever URL is provided in frontend config
+# Register the handler under both POST "/" and POST "/ask" so the frontend can
+# point to either URL without needing a path-specific configuration change.
 @app.post("/")
 @app.post("/ask")
 def ask(file: UploadFile = File(...), question: str = Form(...)):
@@ -216,6 +246,17 @@ def ask(file: UploadFile = File(...), question: str = Form(...)):
         file_bytes = file.file.read()
         if not file_bytes:
             return {"answer": "", "context": "", "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False}
+
+        if len(file_bytes) > 20_000_000:
+            return {
+                "answer": "",
+                "context": "",
+                "char_start": -1,
+                "char_end": -1,
+                "confidence": 0.0,
+                "found": False,
+                "error": "File too large (max 20MB)."
+            }
 
         doc_data = extract_and_chunk_pdf(file_bytes)
         context = select_context(doc_data, question)

@@ -7,14 +7,52 @@ import time
 from pypdf import PdfWriter
 from main import extract_and_chunk_pdf, select_context, get_answer, DOC_CACHE
 
+# Sentence embedded in the test PDF; referenced by multiple tests.
+_DUMMY_TEXT = "The Transformer architecture was introduced in 2017 by Vaswani et al."
+
 
 def create_dummy_pdf() -> bytes:
-    writer = PdfWriter()
-    writer.add_blank_page(width=200, height=200)
-    # Write a small page with text
-    stream = io.BytesIO()
-    writer.write(stream)
-    return stream.getvalue()
+    """
+    Build a minimal but valid PDF that contains real extractable text.
+    Byte offsets in the xref table are computed precisely so pypdf can parse
+    the file without falling back to a full-file object-stream scan.
+    """
+    content_stream = (
+        f"BT /F1 12 Tf 72 720 Td ({_DUMMY_TEXT}) Tj ET"
+    ).encode("latin-1")
+
+    obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+    obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+    obj3 = (
+        b"3 0 obj\n"
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]\n"
+        b"   /Resources << /Font << /F1 << /Type /Font /Subtype /Type1"
+        b" /BaseFont /Helvetica >> >> >>\n"
+        b"   /Contents 4 0 R >>\nendobj\n"
+    )
+    obj4 = (
+        b"4 0 obj\n<< /Length " + str(len(content_stream)).encode() + b" >>\n"
+        b"stream\n" + content_stream + b"\nendstream\nendobj\n"
+    )
+
+    header = b"%PDF-1.4\n"
+    offsets = []
+    body = b""
+    for obj in (obj1, obj2, obj3, obj4):
+        offsets.append(len(header) + len(body))
+        body += obj
+
+    xref_pos = len(header) + len(body)
+    xref = b"xref\n0 5\n0000000000 65535 f \n"
+    for off in offsets:
+        xref += f"{off:010d} 00000 n \n".encode()
+
+    trailer = (
+        b"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n"
+        + str(xref_pos).encode()
+        + b"\n%%EOF\n"
+    )
+    return header + body + xref + trailer
 
 
 def test_qa_exact_span():
@@ -45,14 +83,17 @@ def test_cache_speedup():
     dummy_bytes = create_dummy_pdf()
     DOC_CACHE.clear()
 
-    # First call - cache miss
+    # First call - cache miss; must successfully extract the embedded sentence.
     d1 = extract_and_chunk_pdf(dummy_bytes)
     assert len(DOC_CACHE) == 1
+    assert any(_DUMMY_TEXT in s for s in d1["sentences"]), (
+        f"Expected '{_DUMMY_TEXT}' to appear in extracted sentences, got: {d1['sentences']}"
+    )
 
-    # Second call - cache hit (same object returned instantly)
+    # Second call - cache hit; must return the exact same dict object instantly.
     d2 = extract_and_chunk_pdf(dummy_bytes)
     assert d1 is d2, "Expected cache to return the same dict instance"
-    print("[PASS] Document embedding cache verified.")
+    print("[PASS] Document embedding cache and real text extraction verified.")
 
 
 def test_empty_inputs():
