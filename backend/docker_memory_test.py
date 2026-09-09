@@ -4,12 +4,21 @@ docker_memory_test.py — automated memory-limit test of the Dockerized backend.
 
 Usage:
     python docker_memory_test.py <path/to/paper.pdf>
+                                  [--retrieval-mode tfidf|dense|hybrid]
+                                  [--use-reranker true|false]
 
 Requires Docker Desktop to be running.  Run from inside backend/.
+
+--retrieval-mode / --use-reranker are forwarded to the container as
+RETRIEVAL_MODE / USE_RERANKER environment variables (-e flags on
+`docker run`), matching the overrides main.py reads at startup — so testing
+a different config no longer requires hand-writing a `docker run` command.
+Omit either flag to use the image's built-in defaults.
 
 Steps:
   1. docker build -t paperqa-backend .
   2. docker run -d --rm -p 8000:8000 --memory=512m --memory-swap=512m
+     [-e RETRIEVAL_MODE=... ] [-e USE_RERANKER=... ]
   3. Poll /health until 200 or 60s timeout
   4. Background thread polls docker stats every 1s
   5. POST /ask with the given PDF
@@ -19,6 +28,7 @@ Steps:
   9. Print PASS/FAIL verdict block
 """
 
+import argparse
 import os
 import re
 import subprocess
@@ -37,14 +47,36 @@ except ImportError:
 # Argument handling
 # ---------------------------------------------------------------------------
 
-if len(sys.argv) < 2:
-    print("Usage: python docker_memory_test.py <path/to/paper.pdf>")
-    sys.exit(1)
+_parser = argparse.ArgumentParser(
+    description="Automated Docker memory-limit test of the PaperQA backend."
+)
+_parser.add_argument("pdf_path", help="Path to a PDF to send in the /ask request.")
+_parser.add_argument(
+    "--retrieval-mode",
+    choices=["tfidf", "dense", "hybrid"],
+    default=None,
+    help="Overrides RETRIEVAL_MODE inside the container (default: image default).",
+)
+_parser.add_argument(
+    "--use-reranker",
+    choices=["true", "false"],
+    default=None,
+    help="Overrides USE_RERANKER inside the container (default: image default).",
+)
+_args = _parser.parse_args()
 
-pdf_path = sys.argv[1]
+pdf_path = _args.pdf_path
 if not os.path.isfile(pdf_path):
     print(f"File not found: {pdf_path}")
     sys.exit(1)
+
+# -e flags to append to `docker run`, built from whichever overrides were
+# actually passed — leaving both unset preserves the image's own defaults.
+_env_overrides: list[str] = []
+if _args.retrieval_mode is not None:
+    _env_overrides += ["-e", f"RETRIEVAL_MODE={_args.retrieval_mode}"]
+if _args.use_reranker is not None:
+    _env_overrides += ["-e", f"USE_RERANKER={_args.use_reranker}"]
 
 BACKEND_DIR   = os.path.dirname(os.path.abspath(__file__))
 IMAGE_NAME    = "paperqa-backend"
@@ -159,6 +191,8 @@ print("=" * 65)
 print("  PaperQA Docker Memory Test")
 print(f"  PDF:    {pdf_path}")
 print(f"  Limit:  {MEMORY_LIMIT}  |  Image: {IMAGE_NAME}")
+print(f"  RETRIEVAL_MODE override: {_args.retrieval_mode or '(image default)'}")
+print(f"  USE_RERANKER override:   {_args.use_reranker or '(image default)'}")
 print("=" * 65)
 
 try:
@@ -180,6 +214,7 @@ try:
         "-p", "8000:8000",
         f"--memory={MEMORY_LIMIT}",
         f"--memory-swap={MEMORY_LIMIT}",
+        *_env_overrides,
         "--name", CONTAINER_NAME,
         IMAGE_NAME,
     ])
