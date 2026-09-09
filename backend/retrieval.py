@@ -4,7 +4,7 @@ Retrieval, reranking, and page-number resolution.
 Public API:
   select_context(doc_data, question)           -> str
   select_context_with_meta(doc_data, question) -> dict
-  rerank_windows(question, windows)            -> list[str]
+  rerank_windows(question, windows)            -> list[tuple[int, str]]
   resolve_page_number(char_start, ...)         -> (int|None, int|None)
 
 Module-level flags (monkeypatch-safe — eval.py patches these between runs):
@@ -103,21 +103,30 @@ def _assemble_context(
 # Reranker
 # ---------------------------------------------------------------------------
 
-def rerank_windows(question: str, windows: list[str]) -> list[str]:
+def rerank_windows(
+    question: str,
+    windows: list[str],
+) -> list[tuple[int, str]]:
     """
     Score each (question, window) pair with the ONNX cross-encoder in a single
     batched session.run() call and return windows sorted by descending score,
     pruned by a score-gap margin and an absolute floor.
+
+    Returns a list of (original_index, window_text) pairs so callers can look
+    up per-window metadata by the original index rather than by window text
+    (which is not unique — duplicate windows from repeated journal headers or
+    boilerplate would silently collapse a text-keyed dict).
 
     Cutoff:
       - Keep windows within RERANKER_MARGIN logit units of the top score.
       - Bounds: MIN_RERANKED ≤ returned count ≤ MAX_RERANKED.
       - If top score < RERANKER_SCORE_FLOOR return only the single best window.
 
-    Reranker failure never breaks a request — input is returned unchanged.
+    Reranker failure never breaks a request — input is returned as
+    [(i, windows[i]) for i in range(len(windows))].
     """
     if not windows:
-        return windows
+        return []
 
     try:
         rtok, rsess = get_reranker()
@@ -149,12 +158,13 @@ def rerank_windows(question: str, windows: list[str]) -> list[str]:
         top_score = float(scores.max())
 
         if top_score < RERANKER_SCORE_FLOOR:
-            return [windows[int(scores.argmax())]]
+            best = int(scores.argmax())
+            return [(best, windows[best])]
 
         ranked: list[int] = sorted(
             range(len(windows)), key=lambda i: scores[i], reverse=True
         )
-        selected: list[str] = []
+        selected: list[tuple[int, str]] = []
         for rank_pos, win_idx in enumerate(ranked):
             if rank_pos >= MAX_RERANKED:
                 break
@@ -162,12 +172,12 @@ def rerank_windows(question: str, windows: list[str]) -> list[str]:
                 top_score - float(scores[win_idx])
             ) > RERANKER_MARGIN:
                 break
-            selected.append(windows[win_idx])
+            selected.append((win_idx, windows[win_idx]))
 
-        return selected if selected else [windows[ranked[0]]]
+        return selected if selected else [(ranked[0], windows[ranked[0]])]
 
     except Exception:
-        return windows
+        return list(enumerate(windows))
 
 
 # ---------------------------------------------------------------------------
@@ -365,15 +375,17 @@ def select_context_with_meta(
         }
 
     # ── Reranking path ───────────────────────────────────────────────────────
-    reranked_texts    = rerank_windows(question, cand_windows)
-    text_to_sent_offs = dict(zip(cand_windows, cand_sent_offs))
+    # rerank_windows returns (original_index, text) pairs so we can look up
+    # the correct sent_offsets by index — avoids the text-keyed dict that
+    # silently collapses duplicate window texts.
+    reranked_pairs = rerank_windows(question, cand_windows)
 
     TOKEN_BUDGET = 480   # 512 − ~32 special tokens
     sel_windows:   list[str]         = []
     sel_sent_offs: list[list[tuple]] = []
     cumulative = 0
 
-    for window in reranked_texts:
+    for orig_idx, window in reranked_pairs:
         try:
             tok, _ = get_model()
             n_toks = len(tok.encode(window).ids)
@@ -382,12 +394,13 @@ def select_context_with_meta(
         if cumulative + n_toks > TOKEN_BUDGET:
             break
         sel_windows.append(window)
-        sel_sent_offs.append(text_to_sent_offs.get(window, []))
+        sel_sent_offs.append(cand_sent_offs[orig_idx])
         cumulative += n_toks
 
-    if not sel_windows:
-        sel_windows   = reranked_texts[:1]
-        sel_sent_offs = [text_to_sent_offs.get(reranked_texts[0], [])]
+    if not sel_windows and reranked_pairs:
+        first_idx, first_win = reranked_pairs[0]
+        sel_windows   = [first_win]
+        sel_sent_offs = [cand_sent_offs[first_idx]]
 
     ctx, w_off, ws_off = _assemble_context(sel_windows, sel_sent_offs)
     return {

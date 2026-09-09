@@ -177,7 +177,7 @@ def get_reranker() -> tuple:
                     _reranker_tokenizer.enable_truncation(max_length=512)
                     _reranker_session = ort.InferenceSession(
                         os.path.join(ONNX_RERANKER_DIR, "model_quantized.onnx"),
-                        sess_opts=sess_opts,
+                        sess_options=sess_opts,
                         providers=["CPUExecutionProvider"],
                     )
                 else:
@@ -209,7 +209,7 @@ def get_reranker() -> tuple:
                     _reranker_tokenizer.enable_truncation(max_length=512)
                     _reranker_session = ort.InferenceSession(
                         os.path.join(ONNX_RERANKER_DIR, "model_quantized.onnx"),
-                        sess_opts=sess_opts,
+                        sess_options=sess_opts,
                         providers=["CPUExecutionProvider"],
                     )
                 gc.collect()
