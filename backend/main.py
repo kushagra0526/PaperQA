@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import AutoTokenizer
+from tokenizers import Tokenizer
 import onnxruntime as ort
 
 # Preserve negation terms that sklearn's built-in "english" stopword list removes.
@@ -67,8 +67,12 @@ def get_model():
                 session_options.inter_op_num_threads = 1
 
                 if os.path.isdir(ONNX_MODEL_DIR):
-                    # Load the pre-exported, quantized ONNX model from the build step.
-                    tokenizer = AutoTokenizer.from_pretrained(ONNX_MODEL_DIR)
+                    # Load the standalone tokenizer directly from tokenizer.json.
+                    # This avoids importing transformers (and its conditional torch
+                    # import via is_torch_available()) entirely from the runtime path.
+                    _tok_path = os.path.join(ONNX_MODEL_DIR, "tokenizer.json")
+                    tokenizer = Tokenizer.from_file(_tok_path)
+                    tokenizer.enable_truncation(max_length=512)
                     model = ort.InferenceSession(
                         os.path.join(ONNX_MODEL_DIR, "model_quantized.onnx"),
                         sess_options=session_options,
@@ -76,12 +80,12 @@ def get_model():
                     )
                 else:
                     # Dev fallback: export + quantize on-the-fly if preload.py
-                    # hasn't been run yet.  Uses optimum only at build time;
-                    # the resulting session is a plain ort.InferenceSession.
+                    # hasn't been run yet.  Uses optimum/transformers only at build
+                    # time; the resulting session is a plain ort.InferenceSession.
                     from optimum.onnxruntime import ORTModelForQuestionAnswering, ORTQuantizer
                     from optimum.onnxruntime.configuration import AutoQuantizationConfig
+                    from transformers import AutoTokenizer as _AutoTokenizer
                     from tempfile import TemporaryDirectory
-                    tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
                     with TemporaryDirectory() as tmp_dir:
                         _ort_model = ORTModelForQuestionAnswering.from_pretrained(
                             QA_MODEL_NAME, export=True
@@ -90,7 +94,10 @@ def get_model():
                         _quantizer = ORTQuantizer.from_pretrained(tmp_dir)
                         _qconfig = AutoQuantizationConfig.avx2(is_static=False, per_channel=False)
                         _quantizer.quantize(save_dir=ONNX_MODEL_DIR, quantization_config=_qconfig)
-                    tokenizer.save_pretrained(ONNX_MODEL_DIR)
+                    _AutoTokenizer.from_pretrained(QA_MODEL_NAME).save_pretrained(ONNX_MODEL_DIR)
+                    _tok_path = os.path.join(ONNX_MODEL_DIR, "tokenizer.json")
+                    tokenizer = Tokenizer.from_file(_tok_path)
+                    tokenizer.enable_truncation(max_length=512)
                     model = ort.InferenceSession(
                         os.path.join(ONNX_MODEL_DIR, "model_quantized.onnx"),
                         sess_options=session_options,
@@ -214,24 +221,26 @@ def get_answer(question: str, context: str) -> dict:
     try:
         tok, model = get_model()
 
-        inputs = tok(
-            question,
-            context,
-            return_tensors='np',
-            return_offsets_mapping=True,
-            truncation=True,
-            max_length=512
-        )
+        # tokenizers.Tokenizer.encode() returns an Encoding object directly.
+        # Unlike the transformers tokenizer called as a function, it does not add
+        # a batch dimension — enc.ids, enc.offsets, enc.sequence_ids are flat lists.
+        enc = tok.encode(question, context)
 
-        offset_mapping = inputs['offset_mapping'][0]
-        seq_ids = inputs.sequence_ids(0)
+        # Build numpy input arrays (batch size = 1) for the ONNX session.
+        inputs = {
+            "input_ids":      np.array([enc.ids],           dtype=np.int64),
+            "attention_mask": np.array([enc.attention_mask], dtype=np.int64),
+            "token_type_ids": np.array([enc.type_ids],       dtype=np.int64),
+        }
+
+        # enc.offsets: flat list of (char_start, char_end) tuples, one per token.
+        # enc.sequence_ids: flat list of None (special), 0 (question), 1 (context).
+        offset_mapping  = enc.offsets        # no [0] needed — already unbatched
+        seq_ids         = enc.sequence_ids
         context_indices = [i for i, s in enumerate(seq_ids) if s == 1]
         if not context_indices:
             return extract_fallback_span(question, context)
 
-        # ONNX Runtime does not build a computation graph, so no torch.no_grad()
-        # context manager is needed.  Inputs and outputs are numpy arrays.
-        #
         # Session inputs:  input_ids, attention_mask, token_type_ids  (all int64)
         # Session outputs: start_logits, end_logits                   (float32)
         # Verified via session.get_inputs()/get_outputs() against model_quantized.onnx.
