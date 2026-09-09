@@ -20,3 +20,5 @@ nltk
 optimum[onnxruntime]
 transformers
 numpy
+# requests: used by test_concurrency.py (dev/debug script only — not needed at runtime).
+requests
