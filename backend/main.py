@@ -11,6 +11,8 @@ import re
 import threading
 import time
 from io import BytesIO
+import fitz  # PyMuPDF
+import nltk
 import numpy as np
 from fastapi import FastAPI, UploadFile, Form, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +21,17 @@ from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
 from tokenizers import Tokenizer
 import onnxruntime as ort
+
+# Ensure the punkt sentence tokenizer data is present.  nltk.download is a no-op
+# if the resource is already on disk, so this is safe to call at import time.
+try:
+    nltk.data.find("tokenizers/punkt_tab")
+except LookupError:
+    nltk.download("punkt_tab", quiet=True)
+try:
+    nltk.data.find("tokenizers/punkt")
+except LookupError:
+    nltk.download("punkt", quiet=True)
 
 # Preserve negation terms that sklearn's built-in "english" stopword list removes.
 # Stripping "not", "no", "none", "cannot", "never" breaks retrieval for questions
@@ -33,6 +46,12 @@ QA_MODEL_NAME = "deepset/minilm-uncased-squad2"
 # Local directory where preload.py saves the ONNX-exported, INT8-quantized model
 # during the build step.  At runtime, get_model() loads from here if available.
 ONNX_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "onnx_model")
+
+# When True, extract_and_chunk_pdf uses the layout-aware PyMuPDF path
+# (extract_text_layout_aware) which handles two-column papers correctly.
+# Set to False to fall back to the original pypdf-based extraction.
+USE_LAYOUT_AWARE_EXTRACTION = True
+
 tokenizer = None
 model = None
 DOC_CACHE = {}
@@ -139,24 +158,188 @@ def _idle_unload_loop():
 threading.Thread(target=_idle_unload_loop, daemon=True).start()
 
 
+def extract_text_layout_aware(file_bytes: bytes) -> tuple[str, list[dict]]:
+    """
+    Extract text from a PDF using PyMuPDF with layout-aware word ordering.
+
+    For each page, word bounding boxes are used to detect two-column layout.
+    Two-column detection: if a meaningful fraction of words cluster to the left
+    of the page midpoint AND a meaningful fraction cluster to the right, the page
+    is treated as two-column and words are sorted left-column-first, then right.
+    Single-column pages are sorted by (y0, x0) as normal reading order.
+
+    Returns:
+        raw_text:      all pages joined by spaces (matches pypdf format).
+        sentence_meta_words: list of {"page": int} dicts, one per word, used by
+                       the caller to build per-sentence page metadata.
+    """
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+    except Exception:
+        return "", []
+
+    page_texts: list[str] = []
+    # Track which page each word came from so sentence_meta can be populated.
+    word_page_index: list[int] = []   # parallel to the flat word list across all pages
+
+    try:
+        for page_no, page in enumerate(doc):
+            if page_no >= 25:   # mirror the existing 25-page cap
+                break
+
+            words = page.get_text("words")  # list of (x0,y0,x1,y1,word,blk,ln,wn)
+            if not words:
+                continue
+
+            mid_x = page.rect.width / 2.0
+
+            left_words  = [w for w in words if w[0] < mid_x]
+            right_words = [w for w in words if w[0] >= mid_x]
+
+            # Two-column heuristic: both halves must each hold at least 15% of
+            # the total words on the page.  This avoids misclassifying pages with
+            # a small sidebar, header, or margin note as two-column.
+            total = len(words)
+            is_two_column = (
+                total > 0
+                and len(left_words) / total >= 0.15
+                and len(right_words) / total >= 0.15
+            )
+
+            if is_two_column:
+                ordered = sorted(left_words,  key=lambda w: (w[1], w[0])) + \
+                          sorted(right_words, key=lambda w: (w[1], w[0]))
+            else:
+                ordered = sorted(words, key=lambda w: (w[1], w[0]))
+
+            page_text = " ".join(w[4] for w in ordered)
+            page_texts.append(page_text)
+
+            # Record the source page for every word so the caller can map
+            # sentences back to page numbers.
+            word_page_index.extend([page_no] * len(ordered))
+    finally:
+        doc.close()
+
+    raw_text = " ".join(page_texts)
+    return raw_text, word_page_index
+
+
+def _build_sentence_meta(
+    sentences: list[str],
+    raw_text: str,
+    word_page_index: list[int],
+    page_words: list[str],
+) -> list[dict]:
+    """
+    Align each sentence to a page number by finding the sentence's character
+    offset in raw_text, then mapping that to the nearest word's page.
+
+    page_words is a flat list of the word strings in the same order as
+    word_page_index (used to locate character positions).
+    """
+    if not word_page_index or not page_words:
+        return [{"page": 0}] * len(sentences)
+
+    # Build a list of (char_start, page_no) for each word in raw_text so we can
+    # binary-search the sentence's start position to find its page.
+    word_char_starts: list[int] = []
+    pos = 0
+    for word in page_words:
+        # raw_text was built with single spaces between words; find each word's
+        # actual position in the string to stay robust to fitz word content.
+        idx = raw_text.find(word, pos)
+        if idx == -1:
+            idx = pos
+        word_char_starts.append(idx)
+        pos = idx + len(word)
+
+    meta: list[dict] = []
+    for sent in sentences:
+        sent_start = raw_text.find(sent)
+        if sent_start == -1:
+            meta.append({"page": 0})
+            continue
+        # Find the last word whose char_start is <= sent_start.
+        page_no = 0
+        for i, cs in enumerate(word_char_starts):
+            if cs <= sent_start:
+                page_no = word_page_index[i]
+            else:
+                break
+        meta.append({"page": page_no})
+    return meta
+
+
 def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
     pdf_hash = hashlib.sha256(file_bytes).hexdigest()
     if pdf_hash in DOC_CACHE:
         return DOC_CACHE[pdf_hash]
 
-    try:
-        reader = PdfReader(BytesIO(file_bytes))
-        # Cap to first 25 pages to ensure instant parsing on cloud CPUs
-        pages = reader.pages[:25]
-        raw_text = ' '.join(page.extract_text() or '' for page in pages)
-    except Exception:
-        raw_text = ""
+    word_page_index: list[int] = []
+    page_words:      list[str] = []
 
-    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', raw_text) if len(s.strip()) > 15]
+    if USE_LAYOUT_AWARE_EXTRACTION:
+        # Layout-aware path: PyMuPDF word-level extraction with two-column detection.
+        raw_text, word_page_index = extract_text_layout_aware(file_bytes)
+        # Reconstruct flat word list in the same order as word_page_index so
+        # _build_sentence_meta can locate character offsets.
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            try:
+                for page_no, page in enumerate(doc):
+                    if page_no >= 25:
+                        break
+                    words = page.get_text("words")
+                    if not words:
+                        continue
+                    mid_x = page.rect.width / 2.0
+                    left_words  = [w for w in words if w[0] < mid_x]
+                    right_words = [w for w in words if w[0] >= mid_x]
+                    total = len(words)
+                    is_two_column = (
+                        total > 0
+                        and len(left_words) / total >= 0.15
+                        and len(right_words) / total >= 0.15
+                    )
+                    if is_two_column:
+                        ordered = sorted(left_words,  key=lambda w: (w[1], w[0])) + \
+                                  sorted(right_words, key=lambda w: (w[1], w[0]))
+                    else:
+                        ordered = sorted(words, key=lambda w: (w[1], w[0]))
+                    page_words.extend(w[4] for w in ordered)
+            finally:
+                doc.close()
+        except Exception:
+            pass
+    else:
+        # Original pypdf path — unchanged.
+        try:
+            reader = PdfReader(BytesIO(file_bytes))
+            pages = reader.pages[:25]
+            raw_text = ' '.join(page.extract_text() or '' for page in pages)
+        except Exception:
+            raw_text = ""
+
+    # Replace the regex sentence splitter with nltk sent_tokenize, which correctly
+    # handles abbreviations (et al., Fig., e.g.,) and decimal numbers.
+    try:
+        raw_sentences = nltk.sent_tokenize(raw_text) if raw_text.strip() else []
+    except Exception:
+        # Fallback to the old regex if nltk fails for any reason.
+        raw_sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', raw_text)
+
+    sentences = [s.strip() for s in raw_sentences if len(s.strip()) > 15]
     if not sentences:
         sentences = [raw_text.strip()] if raw_text.strip() else ["No text found in document."]
 
-    doc_data = {"text": raw_text, "sentences": sentences}
+    # Build per-sentence page metadata (additive — does not affect existing keys).
+    if USE_LAYOUT_AWARE_EXTRACTION and word_page_index:
+        sentence_meta = _build_sentence_meta(sentences, raw_text, word_page_index, page_words)
+    else:
+        sentence_meta = [{"page": 0}] * len(sentences)
+
+    doc_data = {"text": raw_text, "sentences": sentences, "sentence_meta": sentence_meta}
 
     # Guard cache eviction and insertion together so no other thread can observe
     # a half-updated cache state or evict an entry another thread just inserted.
