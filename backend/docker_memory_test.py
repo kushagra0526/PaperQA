@@ -63,6 +63,7 @@ def stream_run(cmd: list[str], cwd: str | None = None) -> int:
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         cwd=cwd, text=True, bufsize=1,
+        encoding="utf-8", errors="replace",
     )
     for line in proc.stdout:
         print(line, end="", flush=True)
@@ -73,7 +74,8 @@ def stream_run(cmd: list[str], cwd: str | None = None) -> int:
 def capture_run(cmd: list[str]) -> tuple[int, str]:
     """Run *cmd* silently, return (returncode, combined output)."""
     result = subprocess.run(
-        cmd, capture_output=True, text=True
+        cmd, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
     )
     return result.returncode, (result.stdout + result.stderr).strip()
 
