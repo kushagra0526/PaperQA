@@ -32,6 +32,17 @@ if __name__ == "__main__":
         qconfig = AutoQuantizationConfig.avx2(is_static=False, per_channel=False)
         quantizer.quantize(save_dir=ONNX_MODEL_DIR, quantization_config=qconfig)
 
+    # Report the exact filename produced so the runtime loader can be pointed
+    # at the right file (optimum names it model_quantized.onnx by convention,
+    # but this confirms it explicitly after each build).
+    onnx_files = sorted(Path(ONNX_MODEL_DIR).glob("*.onnx"))
+    if onnx_files:
+        print(f"  Quantized ONNX file(s) in output dir:")
+        for f in onnx_files:
+            print(f"    {f.name}  ({f.stat().st_size / 1024 / 1024:.1f} MB)")
+    else:
+        print("  WARNING: no .onnx file found in output directory!")
+
     # Step 3: Save the tokenizer alongside the quantized model so the entire
     # onnx_model/ directory is self-contained for loading at runtime.
     print("  [3/3] Saving tokenizer...")
