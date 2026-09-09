@@ -278,9 +278,33 @@ def select_context_with_meta(
     if not sentences:
         return _EMPTY
 
-    windows_with_offsets    = build_windows_with_offsets(sentences)
+    # ── Filter out sentences that fall after the references/bibliography ──
+    # heading.  sentence_meta entries with past_references=True are kept in
+    # doc_data for display/debugging but excluded from the retrieval pool so
+    # bibliography entries don't outrank actual body text on keyword overlap.
+    # If no heading was detected (past_references never set), nothing changes.
+    sentence_meta_full = doc_data.get("sentence_meta", [{"page": 0}] * len(sentences))
+    body_indices = [
+        i for i, m in enumerate(sentence_meta_full)
+        if not m.get("past_references", False)
+    ]
+    # Fall back to all sentences if the filter would leave us with nothing
+    # (shouldn't happen in practice, but guards against edge cases).
+    if not body_indices:
+        body_indices = list(range(len(sentences)))
+    body_sentences = [sentences[i] for i in body_indices]
+
+    windows_with_offsets    = build_windows_with_offsets(body_sentences)
     windows                 = [w for w, _ in windows_with_offsets]
     sent_offsets_per_window = [so for _, so in windows_with_offsets]
+
+    # Remap the sentence indices in sent_offsets_per_window back to the
+    # original global sentence indices so resolve_page_number can look up
+    # the correct sentence_meta entry.
+    def _remap(so: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
+        return [(body_indices[local_i], ws, we) for local_i, ws, we in so]
+
+    sent_offsets_per_window = [_remap(so) for so in sent_offsets_per_window]
 
     # ── TF-IDF scoring ──────────────────────────────────────────────────────
     try:
