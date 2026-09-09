@@ -27,6 +27,26 @@ ONNX_RERANKER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "on
 
 
 if __name__ == "__main__":
+    # -------------------------------------------------------------------------
+    # NLTK punkt data — download once here so the runtime container never
+    # needs network access to NLTK's servers.  Data is saved to backend/nltk_data/
+    # which is baked into the Docker image by the COPY . . layer that runs
+    # before this script.  extraction.py sets NLTK_DATA at import time to
+    # ensure nltk finds it at runtime.
+    # -------------------------------------------------------------------------
+    import nltk
+
+    _NLTK_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nltk_data")
+    os.makedirs(_NLTK_DATA_DIR, exist_ok=True)
+    print(f"Downloading NLTK punkt data to {_NLTK_DATA_DIR} ...")
+    for _resource in ("punkt", "punkt_tab"):
+        try:
+            nltk.data.find(f"tokenizers/{_resource}", paths=[_NLTK_DATA_DIR])
+            print(f"  {_resource}: already present")
+        except LookupError:
+            nltk.download(_resource, download_dir=_NLTK_DATA_DIR, quiet=False)
+            print(f"  {_resource}: downloaded")
+
     print(f"Exporting {MODEL_NAME} to ONNX and quantizing to dynamic INT8...")
 
     # Step 1: Export the PyTorch model to ONNX format in a temporary directory.

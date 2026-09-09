@@ -6,11 +6,16 @@ Public API used by the rest of the pipeline:
   build_windows(sentences)           -> list[str]
   build_windows_with_offsets(sents)  -> list[(str, [(int,int,int)])]
   DOC_CACHE                          -> the live cache dict (for test teardown)
+
+NLTK punkt data is downloaded once during the Docker build step by preload.py
+into backend/nltk_data/, which is baked into the image.  The runtime container
+never needs network access to NLTK's servers.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import threading
 from io import BytesIO
@@ -20,17 +25,11 @@ import nltk
 import numpy as np   # used by caller modules; re-exported for convenience
 from pypdf import PdfReader
 
-# ---------------------------------------------------------------------------
-# NLTK data guard — download punkt once, silently, if not already present.
-# ---------------------------------------------------------------------------
-try:
-    nltk.data.find("tokenizers/punkt_tab")
-except LookupError:
-    nltk.download("punkt_tab", quiet=True)
-try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
-    nltk.download("punkt", quiet=True)
+# Point nltk at the data directory baked into the image by preload.py.
+# This must happen before any nltk.data.find() or sent_tokenize() call.
+_NLTK_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nltk_data")
+if _NLTK_DATA_DIR not in nltk.data.path:
+    nltk.data.path.insert(0, _NLTK_DATA_DIR)
 
 # ---------------------------------------------------------------------------
 # Feature flags
@@ -57,7 +56,7 @@ _cache_lock = threading.Lock()
 # Layout-aware extraction (PyMuPDF)
 # ---------------------------------------------------------------------------
 
-def extract_text_layout_aware(file_bytes: bytes) -> tuple[str, list[int]]:
+def extract_text_layout_aware(file_bytes: bytes) -> tuple[str, list[int], list[str]]:
     """
     Extract text from a PDF using PyMuPDF with layout-aware word ordering.
 
@@ -72,14 +71,19 @@ def extract_text_layout_aware(file_bytes: bytes) -> tuple[str, list[int]]:
         word_page_index — flat list of page numbers, one entry per word in
                           the same order as the reconstructed text, used by
                           _build_sentence_meta to map sentences to pages.
+        page_words      — flat list of the word strings in the same order as
+                          word_page_index, used by _build_sentence_meta to
+                          locate character offsets.  Computed in the same
+                          single pass — the PDF is never opened twice.
     """
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
     except Exception:
-        return "", []
+        return "", [], []
 
     page_texts: list[str] = []
     word_page_index: list[int] = []
+    page_words: list[str] = []
 
     try:
         for page_no, page in enumerate(doc):
@@ -112,10 +116,11 @@ def extract_text_layout_aware(file_bytes: bytes) -> tuple[str, list[int]]:
 
             page_texts.append(" ".join(w[4] for w in ordered))
             word_page_index.extend([page_no] * len(ordered))
+            page_words.extend(w[4] for w in ordered)
     finally:
         doc.close()
 
-    return " ".join(page_texts), word_page_index
+    return " ".join(page_texts), word_page_index, page_words
 
 
 # ---------------------------------------------------------------------------
@@ -247,10 +252,12 @@ def _mark_references_section(
                 boundary = best_i
             # If every sentence-level search missed (heading is run-on),
             # fall back: find the sentence that *contains* heading_char and
-            # start filtering from the next one.
+            # start filtering from the next one.  Search from near heading_char
+            # (not from the document start) for the same reason as the primary
+            # path — avoid matching an earlier occurrence of a repeated sentence.
             if boundary is None:
                 for i, sent in enumerate(sentences):
-                    pos = raw_text.find(sent)
+                    pos = raw_text.find(sent, max(0, heading_char - len(sent) - 5))
                     if pos != -1 and pos <= heading_char < pos + len(sent):
                         boundary = i + 1
                         break
@@ -282,39 +289,7 @@ def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
     page_words: list[str] = []
 
     if USE_LAYOUT_AWARE_EXTRACTION:
-        raw_text, word_page_index = extract_text_layout_aware(file_bytes)
-        # Reconstruct the flat word list in the same order as word_page_index
-        # so _build_sentence_meta can locate character offsets.
-        try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            try:
-                for page_no, page in enumerate(doc):
-                    if page_no >= 25:
-                        break
-                    words = page.get_text("words")
-                    if not words:
-                        continue
-                    mid_x = page.rect.width / 2.0
-                    left_words  = [w for w in words if w[0] < mid_x]
-                    right_words = [w for w in words if w[0] >= mid_x]
-                    total = len(words)
-                    is_two_column = (
-                        total > 0
-                        and len(left_words) / total >= 0.15
-                        and len(right_words) / total >= 0.15
-                    )
-                    if is_two_column:
-                        ordered = (
-                            sorted(left_words,  key=lambda w: (w[1], w[0]))
-                            + sorted(right_words, key=lambda w: (w[1], w[0]))
-                        )
-                    else:
-                        ordered = sorted(words, key=lambda w: (w[1], w[0]))
-                    page_words.extend(w[4] for w in ordered)
-            finally:
-                doc.close()
-        except Exception:
-            pass
+        raw_text, word_page_index, page_words = extract_text_layout_aware(file_bytes)
     else:
         # Original pypdf path — unchanged.
         try:

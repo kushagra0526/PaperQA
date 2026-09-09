@@ -9,3 +9,5 @@ __pycache__/
 .vscode/
 .idea/
 onnx_model/
+backend/sample.pdf
+backend/nltk_data/
