@@ -4,7 +4,7 @@ Evaluation script for PaperQA backend.
 
 Runs the full pipeline across all combinations of RETRIEVAL_MODE and
 USE_RERANKER in a single invocation by monkeypatching the module-level flags
-in main.py between runs, then restoring them.  Writes a summary Markdown table
+in retrieval.py between runs, then restoring them.  Writes a summary Markdown table
 to EVAL.md alongside per-run JSON artefacts in the results/ directory.
 
 Metrics per combination:
@@ -32,10 +32,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# ── Import everything needed from main at module level ──────────────────────
-# (flags will be monkeypatched per-combination, not imported as values)
-import main as _main
-from main import extract_and_chunk_pdf, select_context_with_meta, get_answer
+# ── Import pipeline modules ─────────────────────────────────────────────────
+# The retrieval flags (RETRIEVAL_MODE, USE_RERANKER) are monkeypatched between
+# runs — patch the retrieval module directly since that's where they live now.
+import retrieval as _main   # alias kept so run_one_combination patches identically
+from extraction import extract_and_chunk_pdf
+from retrieval import select_context_with_meta
+from qa import get_answer
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +105,11 @@ def run_one_combination(
     """
     Evaluate the pipeline over *data* with the given flag combination.
 
-    Monkeypatches main.RETRIEVAL_MODE and main.USE_RERANKER for the duration
-    of this function, then restores the originals regardless of exceptions.
-    select_context_with_meta (and every function it calls) reads these flags
-    as module globals at call time, so patching the module attributes is
-    sufficient — no reimport or reload is needed.
+    Monkeypatches retrieval.RETRIEVAL_MODE and retrieval.USE_RERANKER for the
+    duration of this function, then restores the originals regardless of
+    exceptions.  select_context_with_meta (and every function it calls) reads
+    these flags as module globals at call time, so patching the retrieval module
+    object is sufficient — no reimport or reload is needed.
 
     Returns a summary dict with keys:
       retrieval_mode, use_reranker, total_samples,
@@ -292,7 +295,7 @@ def write_markdown_table(
 # ---------------------------------------------------------------------------
 
 # All combinations the eval script exercises.
-# "dense" and "hybrid" are wired in main.py but not yet fully implemented;
+# "dense" and "hybrid" are wired in retrieval.py but not yet fully implemented;
 # the eval runs them with a graceful fallback (select_context_with_meta
 # falls through to TF-IDF when the embedding model is absent).
 ALL_MODES = ["tfidf", "dense", "hybrid"]
