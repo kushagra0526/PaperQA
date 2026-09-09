@@ -31,6 +31,15 @@ from retrieval import resolve_page_number, select_context_with_meta
 from schemas import AskResponse, HealthResponse
 
 # ---------------------------------------------------------------------------
+# Runtime flag overrides — read from environment so the Docker image can be
+# started in different configurations without rebuilding.
+# Defaults match the hardcoded values in retrieval.py.
+# ---------------------------------------------------------------------------
+import retrieval as _retrieval
+_retrieval.RETRIEVAL_MODE = os.environ.get("RETRIEVAL_MODE", "tfidf")
+_retrieval.USE_RERANKER   = os.environ.get("USE_RERANKER", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
 # CORS — driven by environment variable so it can be tightened per-deployment
 # without a code change.
 # ---------------------------------------------------------------------------
