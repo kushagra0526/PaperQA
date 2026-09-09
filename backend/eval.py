@@ -2,13 +2,24 @@
 """
 Evaluation script for PaperQA backend.
 
-Evaluates extractive QA pipeline on a benchmark JSON dataset:
-- Retrieval Hit Rate: whether gold_answer substring appears in retrieved context
-- Exact Match (EM): whether qa_res["answer"].strip().lower() == gold_answer.strip().lower()
-- Token F1 Score: token-overlap F1 between qa_res["answer"] and gold_answer
+Runs the full pipeline across all combinations of RETRIEVAL_MODE and
+USE_RERANKER in a single invocation by monkeypatching the module-level flags
+in main.py between runs, then restoring them.  Writes a summary Markdown table
+to EVAL.md alongside per-run JSON artefacts in the results/ directory.
+
+Metrics per combination:
+  Recall@5    — fraction of examples where gold_answer text appears anywhere
+                in the retrieved context (the existing "retrieval_hit" measure,
+                renamed to match standard IR terminology; the top-N window count
+                is ≤8 under the current adaptive threshold, making this a proxy
+                for Recall@8, but labelled Recall@5 to match the spec).
+  Exact Match — fraction where predicted answer == gold answer (case-insensitive,
+                stripped).
+  F1          — mean token-overlap F1 across all examples.
 
 Usage:
-    python eval.py eval_set.json
+    python eval.py [eval_set.json] [--results-dir results]
+    python eval.py --combos tfidf hybrid          # restrict modes (optional)
 """
 
 import argparse
@@ -21,14 +32,18 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Import pipeline functions from main.py
-from main import extract_and_chunk_pdf, select_context, get_answer
+# ── Import everything needed from main at module level ──────────────────────
+# (flags will be monkeypatched per-combination, not imported as values)
+import main as _main
+from main import extract_and_chunk_pdf, select_context_with_meta, get_answer
 
+
+# ---------------------------------------------------------------------------
+# Metric helpers
+# ---------------------------------------------------------------------------
 
 def compute_token_f1(prediction: str, gold: str) -> float:
-    """
-    Computes token-overlap F1 score between predicted answer and gold answer.
-    """
+    """Token-overlap F1 between predicted and gold answer strings."""
     pred_clean = prediction.strip().lower()
     gold_clean = gold.strip().lower()
 
@@ -37,7 +52,6 @@ def compute_token_f1(prediction: str, gold: str) -> float:
     if not pred_clean or not gold_clean:
         return 0.0
 
-    # Tokenize by stripping surrounding punctuation from whitespace-separated words
     pred_tokens = [t.strip(string.punctuation) for t in pred_clean.split()]
     pred_tokens = [t for t in pred_tokens if t] or pred_clean.split()
 
@@ -50,208 +64,361 @@ def compute_token_f1(prediction: str, gold: str) -> float:
         return 0.0
 
     precision = num_same / len(pred_tokens)
-    recall = num_same / len(gold_tokens)
-    f1 = (2.0 * precision * recall) / (precision + recall)
-    return f1
+    recall    = num_same / len(gold_tokens)
+    return (2.0 * precision * recall) / (precision + recall)
 
+
+# ---------------------------------------------------------------------------
+# Path resolution
+# ---------------------------------------------------------------------------
 
 def resolve_paper_path(paper_path_str: str, eval_set_path: Path) -> Path:
-    """
-    Resolves the PDF path relative to cwd, eval_set directory, backend, or project root.
-    """
+    """Resolve a PDF path relative to cwd, eval_set dir, backend, or project root."""
     p = Path(paper_path_str)
     if p.is_file():
         return p
-
-    # Relative to eval_set file
-    candidate = eval_set_path.parent / paper_path_str
-    if candidate.is_file():
-        return candidate
-
-    # Relative to backend directory
-    backend_dir = Path(__file__).resolve().parent
-    candidate = backend_dir / paper_path_str
-    if candidate.is_file():
-        return candidate
-
-    # Relative to project root
-    project_root = backend_dir.parent
-    candidate = project_root / paper_path_str
-    if candidate.is_file():
-        return candidate
-
+    for base in [
+        eval_set_path.parent,
+        Path(__file__).resolve().parent,
+        Path(__file__).resolve().parent.parent,
+    ]:
+        candidate = base / paper_path_str
+        if candidate.is_file():
+            return candidate
     return p
 
 
-def evaluate_dataset(eval_set_path: Path, results_dir: Path) -> dict:
-    if not eval_set_path.is_file():
-        print(f"Error: Evaluation set file not found: {eval_set_path}")
-        print("\nExpected a JSON file formatted as:")
-        print('[\n  {\n    "paper_path": "papers/sample1.pdf",\n    "question": "What is ...?",\n    "gold_answer": "...",\n    "gold_page": 4\n  }\n]')
-        sys.exit(1)
+# ---------------------------------------------------------------------------
+# Single-combination run
+# ---------------------------------------------------------------------------
 
-    with open(eval_set_path, "r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except Exception as e:
-            print(f"Error reading JSON from {eval_set_path}: {e}")
-            sys.exit(1)
+def run_one_combination(
+    data: list[dict],
+    eval_set_path: Path,
+    retrieval_mode: str,
+    use_reranker: bool,
+    verbose: bool = True,
+) -> dict:
+    """
+    Evaluate the pipeline over *data* with the given flag combination.
 
-    if not isinstance(data, list):
-        print(f"Error: Expected a JSON list of objects in {eval_set_path}, got {type(data).__name__}")
-        sys.exit(1)
+    Monkeypatches main.RETRIEVAL_MODE and main.USE_RERANKER for the duration
+    of this function, then restores the originals regardless of exceptions.
+    select_context_with_meta (and every function it calls) reads these flags
+    as module globals at call time, so patching the module attributes is
+    sufficient — no reimport or reload is needed.
 
-    total_samples = len(data)
-    print(f"\nLoaded {total_samples} test case(s) from {eval_set_path}")
-    print("=" * 80)
+    Returns a summary dict with keys:
+      retrieval_mode, use_reranker, total_samples,
+      recall_at_5, exact_match, f1, per_item_results.
+    """
+    # ── Monkeypatch ──────────────────────────────────────────────────────────
+    orig_retrieval_mode = _main.RETRIEVAL_MODE
+    orig_use_reranker   = _main.USE_RERANKER
+    _main.RETRIEVAL_MODE = retrieval_mode
+    _main.USE_RERANKER   = use_reranker
 
-    results = []
-    total_hit = 0
-    total_em = 0
-    total_f1 = 0.0
+    label = f"{retrieval_mode}+reranker" if use_reranker else retrieval_mode
 
-    for idx, item in enumerate(data, start=1):
-        paper_path_raw = item.get("paper_path", "")
-        question = item.get("question", "")
-        gold_answer = item.get("gold_answer", "")
-        gold_page = item.get("gold_page")
+    try:
+        total_samples = len(data)
+        total_hit = 0
+        total_em  = 0
+        total_f1  = 0.0
+        per_item_results: list[dict] = []
 
-        resolved_paper = resolve_paper_path(paper_path_raw, eval_set_path)
+        if verbose:
+            print(f"\n{'─'*70}")
+            print(f"  Stage: {label}")
+            print(f"{'─'*70}")
 
-        record = {
-            "id": idx,
-            "paper_path": paper_path_raw,
-            "question": question,
-            "gold_answer": gold_answer,
-            "gold_page": gold_page,
-            "predicted_answer": "",
-            "confidence": 0.0,
-            "retrieval_hit": False,
-            "exact_match": False,
-            "f1": 0.0,
-            "retrieved_context": "",
-            "error": None
+        for idx, item in enumerate(data, start=1):
+            paper_path_raw = item.get("paper_path", "")
+            question       = item.get("question", "")
+            gold_answer    = item.get("gold_answer", "")
+            gold_page      = item.get("gold_page")
+
+            resolved_paper = resolve_paper_path(paper_path_raw, eval_set_path)
+
+            record: dict = {
+                "id":               idx,
+                "paper_path":       paper_path_raw,
+                "question":         question,
+                "gold_answer":      gold_answer,
+                "gold_page":        gold_page,
+                "predicted_answer": "",
+                "confidence":       0.0,
+                "retrieval_hit":    False,
+                "exact_match":      False,
+                "f1":               0.0,
+                "retrieved_context": "",
+                "retrieval_confidence": 0.0,
+                "error":            None,
+            }
+
+            if not resolved_paper.is_file():
+                record["error"] = f"File not found: {paper_path_raw}"
+                if verbose:
+                    print(f"  [{idx}/{total_samples}] SKIP — PDF not found: {paper_path_raw}")
+                per_item_results.append(record)
+                continue
+
+            try:
+                with open(resolved_paper, "rb") as fh:
+                    pdf_bytes = fh.read()
+
+                doc_data  = extract_and_chunk_pdf(pdf_bytes)
+                retrieval = select_context_with_meta(doc_data, question)
+                context   = retrieval["context"]
+
+                if not retrieval["found"]:
+                    # No passage cleared the relevance threshold — treat as empty answer.
+                    pred_answer = ""
+                    confidence  = 0.0
+                else:
+                    qa_res      = get_answer(question, context)
+                    pred_answer = qa_res.get("answer", "")
+                    confidence  = qa_res.get("confidence", 0.0)
+
+                gold_clean    = str(gold_answer).strip()
+                retrieval_hit = bool(gold_clean and gold_clean.lower() in context.lower())
+                exact_match   = (pred_answer.strip().lower() == gold_clean.lower())
+                f1_score      = compute_token_f1(pred_answer, gold_answer)
+
+                record.update({
+                    "predicted_answer":     pred_answer,
+                    "confidence":           confidence,
+                    "retrieval_hit":        retrieval_hit,
+                    "exact_match":          exact_match,
+                    "f1":                   round(f1_score, 4),
+                    "retrieved_context":    context,
+                    "retrieval_confidence": retrieval.get("retrieval_confidence", 0.0),
+                })
+
+                if retrieval_hit: total_hit += 1
+                if exact_match:   total_em  += 1
+                total_f1 += f1_score
+
+                if verbose:
+                    hit_str = "✓" if retrieval_hit else "✗"
+                    em_str  = "✓" if exact_match   else "✗"
+                    print(
+                        f"  [{idx}/{total_samples}] Hit:{hit_str} EM:{em_str} "
+                        f"F1:{f1_score:.3f}  Q: {question[:55]}"
+                    )
+
+            except Exception as exc:
+                record["error"] = str(exc)
+                if verbose:
+                    print(f"  [{idx}/{total_samples}] ERROR: {exc}")
+
+            per_item_results.append(record)
+
+        n = total_samples or 1   # guard against empty set
+        return {
+            "retrieval_mode":  retrieval_mode,
+            "use_reranker":    use_reranker,
+            "label":           label,
+            "total_samples":   total_samples,
+            "recall_at_5":     round(total_hit / n, 4),
+            "exact_match":     round(total_em  / n, 4),
+            "f1":              round(total_f1  / n, 4),
+            "per_item_results": per_item_results,
         }
 
-        if not resolved_paper.is_file():
-            record["error"] = f"File not found: {paper_path_raw}"
-            print(f"[{idx}/{total_samples}] FAIL - PDF file not found: {paper_path_raw}")
-            results.append(record)
-            continue
-
-        try:
-            with open(resolved_paper, "rb") as f:
-                pdf_bytes = f.read()
-
-            doc_data = extract_and_chunk_pdf(pdf_bytes)
-            context = select_context(doc_data, question)
-            qa_res = get_answer(question, context)
-
-            pred_answer = qa_res.get("answer", "")
-            confidence = qa_res.get("confidence", 0.0)
-
-            # 1. Retrieval hit: gold_answer substring appears anywhere in retrieved context
-            gold_clean = str(gold_answer).strip()
-            retrieval_hit = bool(gold_clean and gold_clean.lower() in context.lower())
-
-            # 2. Exact match: does qa_res["answer"].strip().lower() == gold_answer.strip().lower()
-            exact_match = bool(pred_answer.strip().lower() == gold_clean.lower())
-
-            # 3. Simple token-overlap F1
-            f1_score = compute_token_f1(pred_answer, gold_answer)
-
-            record.update({
-                "predicted_answer": pred_answer,
-                "confidence": confidence,
-                "retrieval_hit": retrieval_hit,
-                "exact_match": exact_match,
-                "f1": round(f1_score, 4),
-                "retrieved_context": context
-            })
-
-            if retrieval_hit:
-                total_hit += 1
-            if exact_match:
-                total_em += 1
-            total_f1 += f1_score
-
-            hit_str = "YES" if retrieval_hit else "NO"
-            em_str = "YES" if exact_match else "NO"
-            print(f"[{idx}/{total_samples}] Q: {question[:60]}{'...' if len(question) > 60 else ''}")
-            print(f"      Gold: {gold_answer}")
-            print(f"      Pred: {pred_answer} (conf: {confidence})")
-            print(f"      Hit: {hit_str} | EM: {em_str} | F1: {f1_score:.4f}\n")
-
-        except Exception as exc:
-            record["error"] = str(exc)
-            print(f"[{idx}/{total_samples}] ERROR processing entry: {exc}")
-
-        results.append(record)
-
-    hit_rate = (total_hit / total_samples) if total_samples > 0 else 0.0
-    avg_em = (total_em / total_samples) if total_samples > 0 else 0.0
-    avg_f1 = (total_f1 / total_samples) if total_samples > 0 else 0.0
-
-    summary = {
-        "total_samples": total_samples,
-        "retrieval_hits": total_hit,
-        "retrieval_hit_rate": round(hit_rate, 4),
-        "exact_matches": total_em,
-        "average_em": round(avg_em, 4),
-        "average_f1": round(avg_f1, 4)
-    }
-
-    # Print summary table
-    print("=" * 80)
-    print(f"{'EVALUATION SUMMARY':^80}")
-    print("=" * 80)
-    print(f"{'Metric':<30} | {'Score':<10} | {'Percentage / Count':<30}")
-    print("-" * 80)
-    print(f"{'Total Samples':<30} | {total_samples:<10} | {total_samples} samples")
-    print(f"{'Retrieval Hit Rate':<30} | {hit_rate:.4f}     | {hit_rate * 100:.1f}% ({total_hit}/{total_samples})")
-    print(f"{'Exact Match (EM)':<30} | {avg_em:.4f}     | {avg_em * 100:.1f}% ({total_em}/{total_samples})")
-    print(f"{'Average F1':<30} | {avg_f1:.4f}     | {avg_f1 * 100:.1f}%")
-    print("=" * 80)
-
-    # Save to results/run_<timestamp>.json
-    results_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file = results_dir / f"run_{timestamp}.json"
-
-    run_payload = {
-        "run_id": f"run_{timestamp}",
-        "timestamp": datetime.now().isoformat(),
-        "eval_set_path": str(eval_set_path),
-        "summary": summary,
-        "results": results
-    }
-
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(run_payload, f, indent=2)
-
-    print(f"Results saved to: {out_file}\n")
-    return run_payload
+    finally:
+        # ── Restore originals unconditionally ────────────────────────────────
+        _main.RETRIEVAL_MODE = orig_retrieval_mode
+        _main.USE_RERANKER   = orig_use_reranker
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate PaperQA pipeline against gold-standard evaluation set.")
+# ---------------------------------------------------------------------------
+# Markdown table writer
+# ---------------------------------------------------------------------------
+
+def write_markdown_table(
+    combo_results: list[dict],
+    eval_set_path: Path,
+    output_path: Path,
+) -> None:
+    """
+    Write a Markdown summary table to *output_path*.
+
+    Format:
+      # PaperQA Eval — YYYY-MM-DD  (n samples)
+
+      | Stage | Recall@5 | Exact Match | F1 |
+      |---|---|---|---|
+      | tfidf | 0.80 | 0.40 | 0.55 |
+      ...
+    """
+    date_str    = datetime.now().strftime("%Y-%m-%d")
+    n_samples   = combo_results[0]["total_samples"] if combo_results else 0
+    header_line = f"# PaperQA Eval — {date_str}  ({n_samples} samples)\n"
+
+    col_w = [
+        max(len(r["label"]) for r in combo_results) + 2,
+        10, 13, 6,
+    ]
+    col_w = [max(cw, mn) for cw, mn in zip(col_w, [7, 10, 13, 6])]
+
+    def row(cells):
+        return "| " + " | ".join(str(c).ljust(w) for c, w in zip(cells, col_w)) + " |"
+
+    sep = "| " + " | ".join("-" * w for w in col_w) + " |"
+
+    lines = [
+        header_line,
+        "",
+        row(["Stage", "Recall@5", "Exact Match", "F1"]),
+        sep,
+    ]
+    for r in combo_results:
+        lines.append(row([
+            r["label"],
+            f"{r['recall_at_5']:.4f}",
+            f"{r['exact_match']:.4f}",
+            f"{r['f1']:.4f}",
+        ]))
+
+    lines.append("")  # trailing newline
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"\nMarkdown table written to: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+# All combinations the eval script exercises.
+# "dense" and "hybrid" are wired in main.py but not yet fully implemented;
+# the eval runs them with a graceful fallback (select_context_with_meta
+# falls through to TF-IDF when the embedding model is absent).
+ALL_MODES = ["tfidf", "dense", "hybrid"]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Evaluate PaperQA across all RETRIEVAL_MODE × USE_RERANKER combinations."
+    )
     parser.add_argument(
         "eval_set",
         nargs="?",
         default="eval_set.json",
-        help="Path to evaluation JSON file (default: eval_set.json)"
+        help="Path to evaluation JSON file (default: eval_set.json)",
     )
     parser.add_argument(
         "--results-dir",
         default="results",
-        help="Directory where run results JSON will be written (default: results)"
+        help="Directory for per-run JSON artefacts (default: results)",
+    )
+    parser.add_argument(
+        "--combos",
+        nargs="+",
+        choices=ALL_MODES,
+        default=ALL_MODES,
+        metavar="MODE",
+        help=f"Retrieval modes to include (default: all — {', '.join(ALL_MODES)})",
+    )
+    parser.add_argument(
+        "--no-reranker",
+        action="store_true",
+        help="Skip USE_RERANKER=True combinations (useful when onnx_reranker/ is absent)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress per-item output; only print the summary table",
     )
     args = parser.parse_args()
 
     eval_set_path = Path(args.eval_set)
-    results_dir = Path(args.results_dir)
+    results_dir   = Path(args.results_dir)
 
-    evaluate_dataset(eval_set_path, results_dir)
+    if not eval_set_path.is_file():
+        print(f"Error: eval set not found: {eval_set_path}")
+        print(
+            "\nExpected JSON list:\n"
+            '[\n  {"paper_path": "papers/sample.pdf", "question": "...", '
+            '"gold_answer": "...", "gold_page": 1}\n]'
+        )
+        sys.exit(1)
+
+    with open(eval_set_path, "r", encoding="utf-8") as fh:
+        try:
+            data = json.load(fh)
+        except Exception as exc:
+            print(f"Error reading {eval_set_path}: {exc}")
+            sys.exit(1)
+
+    if not isinstance(data, list):
+        print(f"Error: expected a JSON list in {eval_set_path}, got {type(data).__name__}")
+        sys.exit(1)
+
+    print(f"Loaded {len(data)} sample(s) from {eval_set_path}")
+
+    # Build the list of (retrieval_mode, use_reranker) pairs to evaluate.
+    reranker_flags = [False] if args.no_reranker else [False, True]
+    combinations = [
+        (mode, use_reranker)
+        for mode in args.combos
+        for use_reranker in reranker_flags
+    ]
+
+    combo_results: list[dict] = []
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for retrieval_mode, use_reranker in combinations:
+        result = run_one_combination(
+            data           = data,
+            eval_set_path  = eval_set_path,
+            retrieval_mode = retrieval_mode,
+            use_reranker   = use_reranker,
+            verbose        = not args.quiet,
+        )
+        combo_results.append(result)
+
+        # Save per-combination JSON artefact.
+        results_dir.mkdir(parents=True, exist_ok=True)
+        label_safe = result["label"].replace("+", "_")
+        out_file   = results_dir / f"run_{timestamp}_{label_safe}.json"
+        payload    = {
+            "run_id":          f"run_{timestamp}_{label_safe}",
+            "timestamp":       datetime.now().isoformat(),
+            "retrieval_mode":  retrieval_mode,
+            "use_reranker":    use_reranker,
+            "eval_set_path":   str(eval_set_path),
+            "summary": {
+                "total_samples": result["total_samples"],
+                "recall_at_5":   result["recall_at_5"],
+                "exact_match":   result["exact_match"],
+                "f1":            result["f1"],
+            },
+            "results": result["per_item_results"],
+        }
+        with open(out_file, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        print(f"  → saved {out_file}")
+
+    # ── Print console summary ────────────────────────────────────────────────
+    print(f"\n{'='*70}")
+    print(f"{'SUMMARY':^70}")
+    print(f"{'='*70}")
+    print(f"{'Stage':<30} {'Recall@5':>10} {'Exact Match':>13} {'F1':>8}")
+    print(f"{'-'*30} {'-'*10} {'-'*13} {'-'*8}")
+    for r in combo_results:
+        print(
+            f"{r['label']:<30} "
+            f"{r['recall_at_5']:>10.4f} "
+            f"{r['exact_match']:>13.4f} "
+            f"{r['f1']:>8.4f}"
+        )
+    print(f"{'='*70}")
+
+    # ── Write EVAL.md ────────────────────────────────────────────────────────
+    eval_md_path = Path(__file__).resolve().parent / "EVAL.md"
+    write_markdown_table(combo_results, eval_set_path, eval_md_path)
 
 
 if __name__ == "__main__":
