@@ -4,8 +4,14 @@
 fastapi
 uvicorn[standard]
 python-multipart
-transformers
+# tokenizers: standalone HuggingFace tokenizer library used at runtime in main.py.
+# Replaces transformers.AutoTokenizer to eliminate transformers' conditional torch
+# import (is_torch_available()) from the server process.
+tokenizers
 scikit-learn
 pypdf
+# optimum + transformers: used only at build time (preload.py) for ONNX export and
+# INT8 quantization — not imported in the runtime path (main.py).
 optimum[onnxruntime]
+transformers
 numpy
