@@ -469,6 +469,56 @@ def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
     return doc_data
 
 
+def build_windows_with_offsets(
+    sentences: list[str],
+) -> list[tuple[str, list[tuple[int, int, int]]]]:
+    """
+    Same windowing logic as build_windows(), but also returns per-window
+    sentence-offset tables needed for page-number resolution.
+
+    Returns a list of (window_text, sent_offsets) pairs where:
+      window_text  — the window string (sentences joined with a single space)
+      sent_offsets — list of (sentence_index, start_in_window, end_in_window)
+                     one entry per sentence in this window, offsets are
+                     character positions within window_text.
+
+    Example for a window made from sentences[2..4]:
+      window_text  = "Sent2. Sent3. Sent4."
+      sent_offsets = [(2, 0, 6), (3, 7, 13), (4, 14, 20)]
+    """
+    if len(sentences) < 3:
+        # Mirror build_windows(): return each sentence as its own "window".
+        result = []
+        for i, s in enumerate(sentences):
+            result.append((s, [(i, 0, len(s))]))
+        return result
+
+    window_size = 3
+    step = 2
+    result: list[tuple[str, list[tuple[int, int, int]]]] = []
+
+    def _make_window(sent_slice_indices: list[int]):
+        """Build one window entry from a list of sentence indices."""
+        offsets: list[tuple[int, int, int]] = []
+        pos = 0
+        parts = []
+        for si in sent_slice_indices:
+            s = sentences[si]
+            offsets.append((si, pos, pos + len(s)))
+            parts.append(s)
+            pos += len(s) + 1  # +1 for the joining space
+        return (" ".join(sentences[si] for si in sent_slice_indices), offsets)
+
+    for start in range(0, len(sentences) - window_size + 1, step):
+        result.append(_make_window(list(range(start, start + window_size))))
+
+    last_start = ((len(sentences) - window_size) // step) * step
+    if last_start + window_size < len(sentences):
+        result.append(_make_window(list(range(len(sentences) - window_size, len(sentences)))))
+
+    return result
+
+
 def build_windows(sentences: list[str]) -> list[str]:
     """
     Group sentences into overlapping windows of 3 with a 1-sentence step,
@@ -484,19 +534,7 @@ def build_windows(sentences: list[str]) -> list[str]:
     If there are fewer than 3 sentences the list is returned unchanged — the
     caller's existing short-circuit handles that case.
     """
-    if len(sentences) < 3:
-        return sentences
-    window_size = 3
-    step = 2  # window_size - 1 overlap sentence
-    windows = []
-    for start in range(0, len(sentences) - window_size + 1, step):
-        windows.append(" ".join(sentences[start : start + window_size]))
-    # If the last full window didn't reach the final sentence(s), append a
-    # trailing window anchored at the end so no sentence is ever left out.
-    last_start = ((len(sentences) - window_size) // step) * step
-    if last_start + window_size < len(sentences):
-        windows.append(" ".join(sentences[-(window_size):]))
-    return windows
+    return [w for w, _ in build_windows_with_offsets(sentences)]
 
 
 def rerank_windows(question: str, windows: list[str]) -> list[str]:
@@ -585,6 +623,82 @@ def rerank_windows(question: str, windows: list[str]) -> list[str]:
         return windows
 
 
+def resolve_page_number(
+    char_start: int,
+    window_offsets: list[tuple[int, int, int]],
+    window_sent_offsets: list[list[tuple[int, int, int]]],
+    sentence_meta: list[dict],
+) -> tuple[int | None, int | None]:
+    """
+    Map a char_start offset in the assembled context string back to a page number
+    and sentence index using two-level offset tables built during context assembly.
+
+    Arguments:
+      char_start          — offset into the final joined context string
+                            (the value returned by get_answer as "char_start")
+      window_offsets      — list of (window_idx, ctx_start, ctx_end) triples,
+                            one per selected window, in the order they appear in
+                            the assembled context string
+      window_sent_offsets — list aligned with window_offsets; each entry is a list
+                            of (sentence_idx, win_start, win_end) triples for the
+                            sentences that make up that window
+      sentence_meta       — doc_data["sentence_meta"]: list of {"page": int} dicts,
+                            indexed by global sentence index
+
+    Returns:
+      (page_number, sentence_index) — both None if resolution fails for any reason.
+
+    Resolution uses char_start (not char_end or midpoint) per spec: the page where
+    the answer begins is the natural "source page" for the user to verify.
+
+    The overlapping sentence shared between adjacent windows is not ambiguous:
+    resolution happens within the specific selected window that was chosen, using
+    that window's own offset table.
+    """
+    if char_start < 0 or not window_offsets:
+        return None, None
+
+    try:
+        # Step 1: find which selected window contains char_start.
+        containing_win_pos = None   # position in window_offsets list
+        for pos, (win_idx, ctx_start, ctx_end) in enumerate(window_offsets):
+            if ctx_start <= char_start < ctx_end:
+                containing_win_pos = pos
+                break
+        # Fallback: if char_start is exactly at or past the last window's end
+        # (can happen with trailing whitespace), use the last window.
+        if containing_win_pos is None:
+            containing_win_pos = len(window_offsets) - 1
+
+        win_idx, ctx_start, _ = window_offsets[containing_win_pos]
+        sent_offsets = window_sent_offsets[containing_win_pos]
+
+        # Step 2: convert to a position relative to the window's own text.
+        win_relative_pos = char_start - ctx_start
+
+        # Step 3: find which sentence within this window contains win_relative_pos.
+        best_sent_idx = sent_offsets[0][0]   # default to first sentence in window
+        for sent_idx, win_start, win_end in sent_offsets:
+            if win_start <= win_relative_pos < win_end:
+                best_sent_idx = sent_idx
+                break
+            # Keep updating best_sent_idx as we scan forward so that if
+            # win_relative_pos falls in inter-sentence whitespace we land on the
+            # nearest preceding sentence rather than defaulting to sent 0.
+            if win_start <= win_relative_pos:
+                best_sent_idx = sent_idx
+
+        # Step 4: look up the page number from sentence_meta.
+        if best_sent_idx < len(sentence_meta):
+            page_no = sentence_meta[best_sent_idx].get("page")
+            return page_no, best_sent_idx
+
+        return None, best_sent_idx
+
+    except Exception:
+        return None, None
+
+
 def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
     """
     Public API used by tests and legacy callers.  Returns the assembled context
@@ -605,7 +719,15 @@ def select_context_with_meta(doc_data: dict, question: str, top_n: int = 5) -> d
         "context":              str,    # assembled context string ('' if not found)
         "retrieval_confidence": float,  # top candidate's normalised score [0, 1]
         "found":                bool,   # False → no passage cleared the threshold
+        "window_offsets":       list,   # [(win_idx, ctx_start, ctx_end), ...]
+        "window_sent_offsets":  list,   # [[(sent_idx, win_start, win_end)], ...]
       }
+
+    window_offsets and window_sent_offsets are the two-level offset tables used by
+    resolve_page_number() to map get_answer's char_start back to a page number.
+    They are parallel lists: window_offsets[i] describes where the i-th selected
+    window sits in the assembled context string; window_sent_offsets[i] describes
+    where each of that window's constituent sentences sit within the window's text.
 
     Retrieval cutoff (replaces the old fixed top_n):
       - Score every window with TF-IDF cosine similarity.
@@ -623,11 +745,20 @@ def select_context_with_meta(doc_data: dict, question: str, top_n: int = 5) -> d
       not exposed here; its effect is already reflected in which windows are
       selected).
     """
+    _EMPTY = {
+        "context": "", "retrieval_confidence": 0.0, "found": False,
+        "window_offsets": [], "window_sent_offsets": [],
+    }
+
     sentences = doc_data.get("sentences", [])
     if not sentences:
-        return {"context": "", "retrieval_confidence": 0.0, "found": False}
+        return _EMPTY
 
-    windows = build_windows(sentences)
+    # Build windows with per-window sentence-offset tables (Step 2 of spec).
+    windows_with_offsets = build_windows_with_offsets(sentences)
+    windows = [w for w, _ in windows_with_offsets]
+    # sent_offsets_per_window[i] = [(sent_idx, start_in_win, end_in_win), ...]
+    sent_offsets_per_window = [so for _, so in windows_with_offsets]
 
     # ------------------------------------------------------------------ #
     # Score all windows with TF-IDF cosine similarity.                    #
@@ -638,10 +769,12 @@ def select_context_with_meta(doc_data: dict, question: str, top_n: int = 5) -> d
         raw_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
     except Exception:
         # TF-IDF failure (e.g. all-stopword question): fall back to first window.
+        if not windows:
+            return _EMPTY
+        ctx, w_off, ws_off = _assemble_context([windows[0]], [sent_offsets_per_window[0]])
         return {
-            "context": windows[0] if windows else "",
-            "retrieval_confidence": 0.0,
-            "found": bool(windows),
+            "context": ctx, "retrieval_confidence": 0.0, "found": True,
+            "window_offsets": w_off, "window_sent_offsets": ws_off,
         }
 
     max_score = float(raw_scores.max()) if len(raw_scores) else 0.0
@@ -651,7 +784,7 @@ def select_context_with_meta(doc_data: dict, question: str, top_n: int = 5) -> d
     # ------------------------------------------------------------------ #
     if max_score == 0.0:
         # Every window scored 0 — no vocabulary overlap with the question.
-        return {"context": "", "retrieval_confidence": 0.0, "found": False}
+        return _EMPTY
 
     threshold = float(np.percentile(raw_scores, 40))
     MAX_CANDIDATES = 8
@@ -676,27 +809,32 @@ def select_context_with_meta(doc_data: dict, question: str, top_n: int = 5) -> d
         above = above + extra[: RERANKER_CANDIDATES - len(above)]
 
     # Restore document order for the non-reranker path (preserves reading coherence).
-    candidates = [windows[i] for i in sorted(above)]
+    doc_order_idx = sorted(above)
+    candidate_windows   = [windows[i]                for i in doc_order_idx]
+    candidate_sent_offs = [sent_offsets_per_window[i] for i in doc_order_idx]
 
     # ------------------------------------------------------------------ #
     # Fast path: no reranking.                                            #
     # ------------------------------------------------------------------ #
     if not USE_RERANKER:
+        ctx, w_off, ws_off = _assemble_context(candidate_windows, candidate_sent_offs)
         return {
-            "context": " ".join(candidates),
-            "retrieval_confidence": retrieval_confidence,
-            "found": True,
+            "context": ctx, "retrieval_confidence": retrieval_confidence, "found": True,
+            "window_offsets": w_off, "window_sent_offsets": ws_off,
         }
 
     # ------------------------------------------------------------------ #
     # Reranking path (USE_RERANKER=True).                                 #
     # ------------------------------------------------------------------ #
-    reranked = rerank_windows(question, candidates)
+    reranked_texts = rerank_windows(question, candidate_windows)
+    # Rebuild the sent_offsets list in the same reranked order.
+    text_to_sent_offs = dict(zip(candidate_windows, candidate_sent_offs))
 
     TOKEN_BUDGET = 480  # 512 minus ~32 for special tokens
-    selected_windows: list[str] = []
+    selected_windows:   list[str]               = []
+    selected_sent_offs: list[list[tuple]]       = []
     cumulative_tokens = 0
-    for window in reranked:
+    for window in reranked_texts:
         try:
             tok, _ = get_model()
             window_tokens = len(tok.encode(window).ids)
@@ -705,16 +843,56 @@ def select_context_with_meta(doc_data: dict, question: str, top_n: int = 5) -> d
         if cumulative_tokens + window_tokens > TOKEN_BUDGET:
             break
         selected_windows.append(window)
+        selected_sent_offs.append(text_to_sent_offs.get(window, []))
         cumulative_tokens += window_tokens
 
     if not selected_windows:
-        selected_windows = reranked[:1]
+        selected_windows   = reranked_texts[:1]
+        selected_sent_offs = [text_to_sent_offs.get(reranked_texts[0], [])]
 
+    ctx, w_off, ws_off = _assemble_context(selected_windows, selected_sent_offs)
     return {
-        "context": " ".join(selected_windows),
-        "retrieval_confidence": retrieval_confidence,
-        "found": True,
+        "context": ctx, "retrieval_confidence": retrieval_confidence, "found": True,
+        "window_offsets": w_off, "window_sent_offsets": ws_off,
     }
+
+
+def _assemble_context(
+    windows: list[str],
+    sent_offsets_per_window: list[list[tuple[int, int, int]]],
+) -> tuple[str, list[tuple[int, int, int]], list[list[tuple[int, int, int]]]]:
+    """
+    Join *windows* with a single space separator and simultaneously build the
+    two-level offset tables required by resolve_page_number().
+
+    Returns:
+      context          — the assembled string
+      window_offsets   — [(win_idx, ctx_start, ctx_end), ...] one per window,
+                         where win_idx is the window's position in *windows*
+      window_sent_offs — parallel to window_offsets; each entry is the
+                         [(sent_idx, win_start, win_end), ...] table for that
+                         window (unchanged from sent_offsets_per_window)
+
+    Walking character by character (rather than using str.join then scanning)
+    means the offsets are exact and require no post-hoc search.
+    """
+    context_parts: list[str] = []
+    window_offsets: list[tuple[int, int, int]] = []
+    window_sent_offs: list[list[tuple[int, int, int]]] = []
+
+    running_pos = 0
+    sep = " "
+    sep_len = len(sep)
+
+    for i, (win_text, s_offs) in enumerate(zip(windows, sent_offsets_per_window)):
+        ctx_start = running_pos
+        ctx_end   = running_pos + len(win_text)
+        window_offsets.append((i, ctx_start, ctx_end))
+        window_sent_offs.append(s_offs)
+        context_parts.append(win_text)
+        running_pos = ctx_end + sep_len  # advance past the separator
+
+    return sep.join(context_parts), window_offsets, window_sent_offs
 
 
 def extract_fallback_span(question: str, context: str) -> dict:
@@ -888,10 +1066,23 @@ def ask(file: UploadFile = File(...), question: str = Form(...)):
                 "answer": "", "context": "", "char_start": -1, "char_end": -1,
                 "confidence": 0.0, "found": False,
                 "retrieval_confidence": retrieval["retrieval_confidence"],
+                "page_number": None,
             }
 
         context = retrieval["context"]
         qa_res = get_answer(question, context)
+
+        # Map the QA model's char_start back to a page number via the two-level
+        # offset tables built during context assembly.  Uses char_start (not
+        # char_end) per spec: the page where the answer begins is the natural
+        # "source page" for the user to verify.
+        page_number, _sentence_index = resolve_page_number(
+            char_start          = qa_res.get("char_start", -1),
+            window_offsets      = retrieval["window_offsets"],
+            window_sent_offsets = retrieval["window_sent_offsets"],
+            sentence_meta       = doc_data.get("sentence_meta", []),
+        )
+
         return {
             "answer":               qa_res.get("answer", ""),
             "context":              context,
@@ -900,10 +1091,11 @@ def ask(file: UploadFile = File(...), question: str = Form(...)):
             "confidence":           qa_res.get("confidence", 0.0),
             "found":                qa_res.get("found", False),
             "retrieval_confidence": retrieval["retrieval_confidence"],
+            "page_number":          page_number,
         }
     except Exception as exc:
         return {
             "answer": "", "context": f"Error processing document: {str(exc)}",
             "char_start": -1, "char_end": -1, "confidence": 0.0, "found": False,
-            "retrieval_confidence": 0.0, "error": str(exc),
+            "retrieval_confidence": 0.0, "page_number": None, "error": str(exc),
         }
