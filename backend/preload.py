@@ -1,20 +1,29 @@
 """
-Pre-exports and quantizes the QA model to ONNX + dynamic INT8 during the build step.
+Pre-exports and quantizes models to ONNX + dynamic INT8 during the build step.
+
+Models exported here:
+  onnx_model/         — deepset/minilm-uncased-squad2 (extractive QA)
+  onnx_reranker/      — cross-encoder/ms-marco-MiniLM-L-6-v2 (reranker)
 
 This runs once during deployment (called by build.sh), not at request time.
-The quantized model is saved to onnx_model/ and loaded by main.py at runtime.
 """
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from transformers import AutoTokenizer
-from optimum.onnxruntime import ORTModelForQuestionAnswering, ORTQuantizer
+from optimum.onnxruntime import (
+    ORTModelForQuestionAnswering,
+    ORTModelForSequenceClassification,
+    ORTQuantizer,
+)
 from optimum.onnxruntime.configuration import AutoQuantizationConfig
 
 
-MODEL_NAME = "deepset/minilm-uncased-squad2"
-ONNX_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "onnx_model")
+MODEL_NAME    = "deepset/minilm-uncased-squad2"
+RERANKER_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+ONNX_MODEL_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "onnx_model")
+ONNX_RERANKER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "onnx_reranker")
 
 
 if __name__ == "__main__":
@@ -61,3 +70,46 @@ if __name__ == "__main__":
     # Report final on-disk size.
     total_size = sum(f.stat().st_size for f in Path(ONNX_MODEL_DIR).rglob("*") if f.is_file())
     print(f"Total model size: {total_size / 1024 / 1024:.1f} MB")
+
+    # -------------------------------------------------------------------------
+    # Cross-encoder reranker: cross-encoder/ms-marco-MiniLM-L-6-v2
+    # -------------------------------------------------------------------------
+    print()
+    print(f"Exporting {RERANKER_NAME} to ONNX and quantizing to dynamic INT8...")
+
+    with TemporaryDirectory() as tmp_dir:
+        print("  [1/3] Exporting reranker to ONNX...")
+        reranker = ORTModelForSequenceClassification.from_pretrained(
+            RERANKER_NAME, export=True
+        )
+        reranker.save_pretrained(tmp_dir)
+
+        print("  [2/3] Applying dynamic INT8 quantization to reranker...")
+        quantizer = ORTQuantizer.from_pretrained(tmp_dir)
+        qconfig = AutoQuantizationConfig.avx2(is_static=False, per_channel=False)
+        quantizer.quantize(save_dir=ONNX_RERANKER_DIR, quantization_config=qconfig)
+
+    # Confirm the output filename.
+    onnx_files = sorted(Path(ONNX_RERANKER_DIR).glob("*.onnx"))
+    if onnx_files:
+        print("  Quantized ONNX file(s) in reranker output dir:")
+        for f in onnx_files:
+            print(f"    {f.name}  ({f.stat().st_size / 1024 / 1024:.1f} MB)")
+    else:
+        print("  WARNING: no .onnx file found in reranker output directory!")
+
+    # Step 3: Save the reranker tokenizer (for runtime use via AutoTokenizer or
+    # tokenizers.Tokenizer.from_file — main.py uses AutoTokenizer here because
+    # cross-encoder tokenizers may not expose a plain tokenizer.json).
+    print("  [3/3] Saving reranker tokenizer...")
+    reranker_tok = AutoTokenizer.from_pretrained(RERANKER_NAME)
+    reranker_tok.save_pretrained(ONNX_RERANKER_DIR)
+    tok_json = Path(ONNX_RERANKER_DIR) / "tokenizer.json"
+    if tok_json.exists():
+        print(f"  tokenizer.json saved: {tok_json}  ({tok_json.stat().st_size / 1024:.1f} KB)")
+    else:
+        print("  WARNING: tokenizer.json not found after save_pretrained!")
+
+    print(f"Quantized reranker ONNX model saved to {ONNX_RERANKER_DIR}/")
+    total_size = sum(f.stat().st_size for f in Path(ONNX_RERANKER_DIR).rglob("*") if f.is_file())
+    print(f"Total reranker size: {total_size / 1024 / 1024:.1f} MB")
