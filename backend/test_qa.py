@@ -5,7 +5,9 @@ Tests document caching, extractive QA with exact offsets, and null-answer reject
 import io
 import time
 from pypdf import PdfWriter
-from main import extract_and_chunk_pdf, select_context, get_answer, DOC_CACHE
+from extraction import extract_and_chunk_pdf, DOC_CACHE
+from retrieval import select_context
+from qa import get_answer
 
 # Sentence embedded in the test PDF; referenced by multiple tests.
 _DUMMY_TEXT = "The Transformer architecture was introduced in 2017 by Vaswani et al."
