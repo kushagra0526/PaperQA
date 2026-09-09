@@ -14,6 +14,7 @@ never needs network access to NLTK's servers.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import os
 import re
@@ -153,18 +154,31 @@ def _build_sentence_meta(
         word_char_starts.append(idx)
         pos = idx + len(word)
 
+    # word_char_starts is non-decreasing by construction (each word is found
+    # at or after the previous word's position), so a per-sentence page
+    # lookup can use bisect instead of a linear scan.
+    #
+    # sent_start is likewise located with a forward-moving cursor rather than
+    # raw_text.find(sent) from position 0 every time: sentences occur in
+    # document order, and searching from 0 each time both re-scans the same
+    # prefix of raw_text repeatedly (O(sentences × len(raw_text)) worst case)
+    # and can mis-attribute a sentence to an earlier duplicate occurrence
+    # (repeated boilerplate/headers) instead of its real position.
     meta: list[dict] = []
+    pos = 0
     for sent in sentences:
-        sent_start = raw_text.find(sent)
+        sent_start = raw_text.find(sent, pos)
+        if sent_start == -1:
+            # Out-of-order relative to the cursor (shouldn't normally happen)
+            # — fall back to a full-text search before giving up.
+            sent_start = raw_text.find(sent)
         if sent_start == -1:
             meta.append({"page": 0})
             continue
-        page_no = 0
-        for i, cs in enumerate(word_char_starts):
-            if cs <= sent_start:
-                page_no = word_page_index[i]
-            else:
-                break
+        pos = sent_start + len(sent)
+
+        word_idx = bisect.bisect_right(word_char_starts, sent_start) - 1
+        page_no = word_page_index[word_idx] if word_idx >= 0 else 0
         meta.append({"page": page_no})
     return meta
 
@@ -235,32 +249,37 @@ def _mark_references_section(
         m = _TEXT_RE.search(tail_text)
         if m:
             heading_char = search_start + m.start(1)
-            # Find the sentence whose occurrence in raw_text is closest to
-            # (and at or after) heading_char.  We can't just take the first
-            # sentence in list order whose text appears after heading_char,
-            # because repeated headers/watermarks mean a short sentence may
-            # match a second occurrence later in the text — we want the
-            # sentence positioned nearest to the actual heading.
-            best_i   = None
-            best_pos = len(raw_text) + 1
-            for i, sent in enumerate(sentences):
-                pos = raw_text.find(sent, max(0, heading_char - 5))
-                if pos != -1 and pos >= heading_char and pos < best_pos:
-                    best_pos = pos
-                    best_i   = i
-            if best_i is not None:
-                boundary = best_i
-            # If every sentence-level search missed (heading is run-on),
-            # fall back: find the sentence that *contains* heading_char and
-            # start filtering from the next one.  Search from near heading_char
-            # (not from the document start) for the same reason as the primary
-            # path — avoid matching an earlier occurrence of a repeated sentence.
-            if boundary is None:
-                for i, sent in enumerate(sentences):
-                    pos = raw_text.find(sent, max(0, heading_char - len(sent) - 5))
-                    if pos != -1 and pos <= heading_char < pos + len(sent):
-                        boundary = i + 1
-                        break
+
+            # Locate each sentence's position in raw_text once, with a
+            # forward-moving cursor (sentences occur in document order), and
+            # binary-search that table instead of re-running raw_text.find()
+            # for every sentence against the full document — the previous
+            # approach was O(sentences × len(raw_text)) in the common case
+            # where most sentences don't match near heading_char at all.
+            sentence_starts: list[int] = []
+            cur = 0
+            for sent in sentences:
+                sp = raw_text.find(sent, cur)
+                if sp == -1:
+                    sp = raw_text.find(sent)
+                if sp == -1:
+                    sp = cur  # unknown position — keep the table monotonic
+                sentence_starts.append(sp)
+                cur = sp + len(sent)
+
+            # Sentence whose occurrence is closest to (and at or after)
+            # heading_char — mirrors the original "nearest match" intent,
+            # now via bisect over the precomputed, in-order positions.
+            idx = bisect.bisect_left(sentence_starts, heading_char)
+            if idx < len(sentences):
+                boundary = idx
+            elif sentence_starts and (
+                sentence_starts[-1] <= heading_char
+                < sentence_starts[-1] + len(sentences[-1])
+            ):
+                # heading_char falls inside the last sentence (run-on
+                # heading) — start filtering from the next one, i.e. none.
+                boundary = len(sentences)
 
     if boundary is not None:
         for i in range(boundary, len(sentence_meta)):
