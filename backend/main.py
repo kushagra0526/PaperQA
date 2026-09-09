@@ -9,14 +9,16 @@ import gc
 import hashlib
 import re
 import threading
+import time
 from io import BytesIO
-import torch
+import numpy as np
 from fastapi import FastAPI, UploadFile, Form, File
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import AutoTokenizer, AutoModelForQuestionAnswering
+from transformers import AutoTokenizer
+from optimum.onnxruntime import ORTModelForQuestionAnswering
 
 # Preserve negation terms that sklearn's built-in "english" stopword list removes.
 # Stripping "not", "no", "none", "cannot", "never" breaks retrieval for questions
@@ -28,9 +30,17 @@ app = FastAPI(title="Scientific Paper QA")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 QA_MODEL_NAME = "deepset/minilm-uncased-squad2"
+# Local directory where preload.py saves the ONNX-exported, INT8-quantized model
+# during the build step.  At runtime, get_model() loads from here if available.
+ONNX_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "onnx_model")
 tokenizer = None
 model = None
 DOC_CACHE = {}
+
+# Timestamp of the most recent call to get_model(), used by the idle-unload
+# thread to decide when to evict the model from memory.
+_last_model_use = 0.0
+_MODEL_IDLE_TIMEOUT = 600  # 10 minutes in seconds
 
 # Lock protecting lazy model initialisation so that concurrent FastAPI threadpool
 # workers cannot trigger duplicate downloads or simultaneous model loads.
@@ -42,27 +52,60 @@ _cache_lock = threading.Lock()
 
 
 def get_model():
-    global tokenizer, model
+    global tokenizer, model, _last_model_use
     # First check without the lock for the common hot-path where model is already loaded.
     if tokenizer is None or model is None:
         with _model_lock:
             # Re-check inside the lock: another thread may have loaded the model
             # between our outer check and acquiring the lock.
             if tokenizer is None or model is None:
-                tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
-                model = AutoModelForQuestionAnswering.from_pretrained(
-                    QA_MODEL_NAME,
-                    low_cpu_mem_usage=True
-                )
-                model.eval()
+                if os.path.isdir(ONNX_MODEL_DIR):
+                    # Load the pre-exported, quantized ONNX model from the build step.
+                    tokenizer = AutoTokenizer.from_pretrained(ONNX_MODEL_DIR)
+                    model = ORTModelForQuestionAnswering.from_pretrained(
+                        ONNX_MODEL_DIR,
+                        file_name="model_quantized.onnx"
+                    )
+                else:
+                    # Dev fallback: export on-the-fly if preload.py hasn't been run.
+                    tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
+                    model = ORTModelForQuestionAnswering.from_pretrained(
+                        QA_MODEL_NAME, export=True
+                    )
                 gc.collect()
+    _last_model_use = time.time()
     return tokenizer, model
+
+
+def _numpy_softmax(x):
+    """Numerically stable softmax over a 1-D numpy array."""
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum()
 
 
 # Start a daemon thread immediately after the server process starts so the model
 # is loaded into RAM before the first real request arrives, avoiding a cold-start
 # latency spike for the initial user.
 threading.Thread(target=get_model, daemon=True).start()
+
+
+def _idle_unload_loop():
+    """Periodically checks whether the model has been idle and unloads it to free memory."""
+    global tokenizer, model
+    while True:
+        time.sleep(120)  # Check every 2 minutes
+        if model is not None and (time.time() - _last_model_use) > _MODEL_IDLE_TIMEOUT:
+            with _model_lock:
+                # Double-check inside the lock in case a request just arrived.
+                if model is not None and (time.time() - _last_model_use) > _MODEL_IDLE_TIMEOUT:
+                    tokenizer = None
+                    model = None
+                    gc.collect()
+
+
+# Background daemon that reclaims model memory after 10 minutes of inactivity.
+# The existing lazy-loading in get_model() will reload it on the next request.
+threading.Thread(target=_idle_unload_loop, daemon=True).start()
 
 
 def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
@@ -87,7 +130,7 @@ def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
     # Guard cache eviction and insertion together so no other thread can observe
     # a half-updated cache state or evict an entry another thread just inserted.
     with _cache_lock:
-        if len(DOC_CACHE) >= 10:
+        if len(DOC_CACHE) >= 3:
             DOC_CACHE.pop(next(iter(DOC_CACHE)))
         DOC_CACHE[pdf_hash] = doc_data
     return doc_data
@@ -150,7 +193,7 @@ def get_answer(question: str, context: str) -> dict:
         inputs = tok(
             question,
             context,
-            return_tensors='pt',
+            return_tensors='np',
             return_offsets_mapping=True,
             truncation=True,
             max_length=512
@@ -162,11 +205,12 @@ def get_answer(question: str, context: str) -> dict:
         if not context_indices:
             return extract_fallback_span(question, context)
 
-        with torch.no_grad():
-            outputs = qa_model(
-                input_ids=inputs['input_ids'],
-                attention_mask=inputs['attention_mask']
-            )
+        # ONNX Runtime does not build a computation graph, so no torch.no_grad()
+        # context manager is needed.  Inputs and outputs are numpy arrays.
+        outputs = qa_model(
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask']
+        )
 
         start_logits = outputs.start_logits[0]
         end_logits = outputs.end_logits[0]
@@ -187,8 +231,8 @@ def get_answer(question: str, context: str) -> dict:
         if best_start == -1 or best_score < null_score:
             return extract_fallback_span(question, context)
 
-        start_prob = float(torch.softmax(start_logits, dim=-1)[best_start])
-        end_prob = float(torch.softmax(end_logits, dim=-1)[best_end])
+        start_prob = float(_numpy_softmax(start_logits)[best_start])
+        end_prob = float(_numpy_softmax(end_logits)[best_end])
         confidence = round(start_prob * end_prob, 4)
 
         if confidence < 0.05:
