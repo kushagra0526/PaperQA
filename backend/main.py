@@ -350,6 +350,36 @@ def extract_and_chunk_pdf(file_bytes: bytes) -> dict:
     return doc_data
 
 
+def build_windows(sentences: list[str]) -> list[str]:
+    """
+    Group sentences into overlapping windows of 3 with a 1-sentence step,
+    so each window shares its last sentence with the start of the next.
+
+    Window indices: [0,1,2], [2,3,4], [4,5,6], ...
+    (step = window_size - overlap = 3 - 1 = 2)
+
+    Each window is returned as a single string with sentences joined by a space,
+    giving the TF-IDF scorer a richer unit of context than a bare sentence while
+    keeping the vocabulary overlap with the question higher than a full paragraph.
+
+    If there are fewer than 3 sentences the list is returned unchanged — the
+    caller's existing short-circuit handles that case.
+    """
+    if len(sentences) < 3:
+        return sentences
+    window_size = 3
+    step = 2  # window_size - 1 overlap sentence
+    windows = []
+    for start in range(0, len(sentences) - window_size + 1, step):
+        windows.append(" ".join(sentences[start : start + window_size]))
+    # If the last full window didn't reach the final sentence(s), append a
+    # trailing window anchored at the end so no sentence is ever left out.
+    last_start = ((len(sentences) - window_size) // step) * step
+    if last_start + window_size < len(sentences):
+        windows.append(" ".join(sentences[-(window_size):]))
+    return windows
+
+
 def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
     sentences = doc_data.get("sentences", [])
     if not sentences:
@@ -357,18 +387,27 @@ def select_context(doc_data: dict, question: str, top_n: int = 5) -> str:
     if len(sentences) <= top_n:
         return ' '.join(sentences)
 
+    # Build overlapping 3-sentence windows so each retrieval unit carries more
+    # context than a single sentence, improving TF-IDF recall for questions
+    # whose answer spans a sentence boundary.
+    # TODO: each window is now ~3x longer than a bare sentence; concatenating
+    # top_n=5 windows can approach or exceed the 512-token budget passed to the
+    # ONNX model — evaluate actual token counts in eval and consider reducing
+    # top_n or trimming the concatenated context if truncation becomes frequent.
+    windows = build_windows(sentences)
+
     try:
         # TF-IDF is used here instead of a neural embedding model because it needs
         # only ~1MB of RAM and runs in under 1ms, avoiding the multi-hundred-MB
         # memory spike that sentence-transformers would cause on memory-constrained hosts.
         vectorizer = TfidfVectorizer(stop_words=CUSTOM_STOPWORDS)
-        tfidf_matrix = vectorizer.fit_transform([question] + sentences)
+        tfidf_matrix = vectorizer.fit_transform([question] + windows)
         scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
         top_n_count = min(top_n, len(scores))
         top_idx = sorted(sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n_count])
-        return ' '.join(sentences[i] for i in top_idx)
+        return ' '.join(windows[i] for i in top_idx)
     except Exception:
-        return ' '.join(sentences[:top_n])
+        return ' '.join(windows[:top_n])
 
 
 def extract_fallback_span(question: str, context: str) -> dict:
